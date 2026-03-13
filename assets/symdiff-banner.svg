@@ -1,0 +1,28 @@
+<svg width="728" height="90" viewBox="0 0 728 90" xmlns="http://www.w3.org/2000/svg">
+  <rect width="728" height="90" fill="#0f172a" />
+  
+  <defs>
+    <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
+      <stop offset="0%" stop-color="#1e293b" stop-opacity="1" />
+      <stop offset="100%" stop-color="#0f172a" stop-opacity="1" />
+    </radialGradient>
+  </defs>
+  <rect width="728" height="90" fill="url(#centerGlow)" />
+
+  <g stroke="#64748b" stroke-width="2" fill="none" stroke-linecap="round">
+    <path d="M 295,18 L 280,18 L 280,72 L 295,72" />
+    <path d="M 432,18 L 447,18 L 447,72 L 432,72" />
+  </g>
+
+  <g fill="#f1f5f9">
+    <text x="296" y="60" font-family="Georgia, serif" font-size="52" font-style="italic">∫</text>
+    
+    <text x="322" y="56" font-family="system-ui, sans-serif" font-size="38" font-weight="200" letter-spacing="-1">ym</text>
+    
+    <text x="378" y="56" font-family="Georgia, serif" font-size="38" font-style="italic">d</text>
+    
+    <text x="400" y="56" font-family="Georgia, serif" font-size="38" font-style="italic">i</text>
+    
+    <text x="413" y="56" font-family="system-ui, sans-serif" font-size="38" font-weight="200" letter-spacing="-3">ff</text>
+  </g>
+</svg>
