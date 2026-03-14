@@ -103,3 +103,6 @@ nightly.
 **[symbolica](https://crates.io/crates/symbolica)** and similar runtime CAS
 crates do the same symbolic work as `symdiff` — but at runtime, on expression
 objects, rather than emitting native Rust at compile time.
+
+>*AI Disclosure* The visitor-transformer model was inspired by AI conversations,
+and documentation is largely AI-generated. All code is handwritten.
