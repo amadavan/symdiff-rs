@@ -1,592 +1,1324 @@
-use std::collections::HashMap;
+//! Symbolic expression tree, arena, and compile-time differentiation.
+//!
+//! # Architecture
+//!
+//! Expressions are stored as nodes in a [`SymArena`] and referenced by integer
+//! [`NodeId`]s.  The arena de-duplicates nodes on insertion (hash-consing), so
+//! structurally identical sub-expressions always share the same id.
+//!
+//! Two traversal patterns are provided:
+//!
+//! - **[`SymVisitor`]** – a read-only, bottom-up tree walk.  Implementors
+//!   receive pre-computed child results together with the arena so they can
+//!   inspect sibling nodes if needed.
+//! - **[`SymTransformer`]** – a rewriting pass that maps every node to a new
+//!   node id.  [`SymArena::transform`] drives it in topological order, passing
+//!   a `diff_map: HashMap<old_id, new_id>` so each handler can look up the
+//!   already-transformed children.
+//!
+//! ## Constant representation
+//!
+//! [`SymNode::Const`] stores its value as the raw IEEE-754 bit pattern of an
+//! `f64` (`u64::from_bits` / `f64::to_bits`).  All code that creates or
+//! inspects constant nodes must go through `f64::to_bits` / `f64::from_bits`
+//! rather than using integer literals directly (except `0`, whose bit pattern
+//! happens to equal `0u64`).
+
+#![allow(unused)]
+
+use std::collections::{HashMap, HashSet};
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
-use syn::Expr;
+use syn::{Expr, Ident};
 
-const DEFAULT_MAX_PASSES: usize = 10;
+/// Index into a [`SymArena`]; uniquely identifies a [`SymNode`].
+type NodeId = usize;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Symbolic expression tree
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A compile-time symbolic expression tree.
+/// A single node in the symbolic expression tree.
 ///
-/// Variables are represented by their 0-based index into the function's `f64`
-/// parameter list rather than by name, so that [`diff`](SymExpr::diff) and
-/// [`into_token_stream`](SymExpr::into_token_stream) can work purely by index
-/// without carrying string state.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum SymExpr {
-    /// A numeric constant.
-    Const(f64),
-    /// The `i`-th `f64` parameter of the function being differentiated.
-    Var(String, i32),
-    /// `lhs + rhs`
-    Add(Box<SymExpr>, Box<SymExpr>),
-    /// `lhs - rhs`
-    Sub(Box<SymExpr>, Box<SymExpr>),
-    /// `lhs * rhs`
-    Mul(Box<SymExpr>, Box<SymExpr>),
-    /// `lhs / rhs`
-    Div(Box<SymExpr>, Box<SymExpr>),
+/// All child references are [`NodeId`]s into the owning [`SymArena`].
+/// Constants are encoded as the raw `f64` bit pattern (`f64::to_bits`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SymNode {
+    /// A numeric constant; the payload is `value.to_bits()`.
+    Const(u64),
+    /// The `idx`-th component of the input slice `x`, i.e. `x[idx]`.
+    Var(NodeId),
+    /// Addition: `left + right`.
+    Add(NodeId, NodeId),
+    /// Subtraction: `left - right`.
+    Sub(NodeId, NodeId),
+    /// Multiplication: `left * right`.
+    Mul(NodeId, NodeId),
+    /// Division: `left / right`.
+    Div(NodeId, NodeId),
     /// Integer power: `base.powi(exp)`.
-    Powi(Box<SymExpr>, i32),
-    /// Negation: `-e`
-    Neg(Box<SymExpr>),
-    /// `e.sin()`
-    Sin(Box<SymExpr>),
-    /// `e.cos()`
-    Cos(Box<SymExpr>),
-    /// Natural logarithm: `e.ln()`
-    Ln(Box<SymExpr>),
-    /// Natural exponential: `e.exp()`
-    Exp(Box<SymExpr>),
-    /// `e.sqrt()`
-    Sqrt(Box<SymExpr>),
-    /// An expression that could not be parsed symbolically.
-    ///
-    /// Its derivative with respect to any variable is assumed to be zero.
-    /// This is safe for sub-expressions that do not depend on the
-    /// differentiation variable (e.g. a call to an opaque helper function),
-    /// but will silently produce an incorrect derivative if the expression
-    /// actually does depend on that variable.
-    Opaque(String),
+    Powi(NodeId, i32),
+    /// Arithmetic negation: `-operand`.
+    Neg(NodeId),
+    /// Sine: `operand.sin()`.
+    Sin(NodeId),
+    /// Cosine: `operand.cos()`.
+    Cos(NodeId),
+    /// Natural logarithm: `operand.ln()`.
+    Ln(NodeId),
+    /// Natural exponential: `operand.exp()`.
+    Exp(NodeId),
+    /// Square root: `operand.sqrt()`.
+    Sqrt(NodeId),
 }
 
-impl SymExpr {
-    /// Algebraically simplify the expression by one bottom-up pass.
-    ///
-    /// Applies constant folding and structural identities:
-    ///
-    /// **Arithmetic**
-    /// - `0 + e = e`, `e + 0 = e`
-    /// - `0 * e = 0`, `1 * e = e`, `e * 1 = e`
-    /// - `e / 1 = e`
-    /// - `--e = e`
-    ///
-    /// **Factor extraction** (for `+` and `-`)
-    /// - `(a*b) + (a*c) = a * (b+c)`, `(a*b) - (a*c) = a * (b-c)`
-    ///
-    /// **Power / exponential**
-    /// - `base^a * base^b = base^(a+b)`, `base^a / base^b = base^(a-b)`
-    /// - `exp(a) * exp(b) = exp(a+b)`, `exp(a) / exp(b) = exp(a-b)`
-    /// - `sqrt(base^(2k)) = base^k`
-    ///
-    /// **Logarithm**
-    /// - `ln(base^n) = n * ln(base)`
-    ///
-    /// **Constant folding** — any node whose children are all [`Const`](SymExpr::Const)
-    /// is evaluated to a single `Const`.
-    ///
-    /// Use [`simplify_multipass`](Self::simplify_multipass) to reach a fixed point
-    /// when rules may cascade across multiple levels.
-    pub fn simplify(&self) -> Self {
-        match self {
-            SymExpr::Const(c) => SymExpr::Const(*c),
-            SymExpr::Var(name, i) => SymExpr::Var(name.clone(), *i),
-            SymExpr::Add(e1, e2) => {
-                let se1 = e1.simplify();
-                let se2 = e2.simplify();
-                match (&se1, &se2) {
-                    (_, SymExpr::Const(0.0)) => se1,
-                    (SymExpr::Const(0.0), _) => se2,
-                    (SymExpr::Const(c1), SymExpr::Const(c2)) => SymExpr::Const(c1 + c2),
-                    (SymExpr::Mul(e1a, e1b), SymExpr::Mul(e2a, e2b))
-                        if e1a == e2a || e1a == e2b =>
-                    {
-                        // (e1 * e2) + (e1 * e3) = e1 * (e2 + e3)
-                        SymExpr::Mul(
-                            Box::new(*e1a.clone()),
-                            Box::new(SymExpr::Add(e1b.clone(), e2b.clone())),
-                        )
-                    }
-                    (SymExpr::Mul(e1a, e1b), SymExpr::Mul(e2a, e2b))
-                        if e1b == e2a || e1b == e2b =>
-                    {
-                        // (e1 * e2) + (e3 * e2) = (e1 + e3) * e2
-                        SymExpr::Mul(
-                            Box::new(SymExpr::Add(e1a.clone(), e2a.clone())),
-                            Box::new(*e1b.clone()),
-                        )
-                    }
-                    _ => SymExpr::Add(Box::new(se1), Box::new(se2)),
-                }
-            }
-            SymExpr::Sub(e1, e2) => {
-                let se1 = e1.simplify();
-                let se2 = e2.simplify();
-                match (&se1, &se2) {
-                    (SymExpr::Const(0.0), _) => SymExpr::Neg(Box::new(se2)),
-                    (_, SymExpr::Const(0.0)) => se1,
-                    (SymExpr::Mul(e1a, e1b), SymExpr::Mul(e2a, e2b))
-                        if e1a == e2a || e1a == e2b =>
-                    {
-                        // (e1 * e2) - (e1 * e3) = e1 * (e2 - e3)
-                        SymExpr::Mul(
-                            Box::new(*e1a.clone()),
-                            Box::new(SymExpr::Sub(e1b.clone(), e2b.clone())),
-                        )
-                    }
-                    (SymExpr::Mul(e1a, e1b), SymExpr::Mul(e2a, e2b))
-                        if e1b == e2a || e1b == e2b =>
-                    {
-                        // (e1 * e2) - (e3 * e2) = (e1 - e3) * e2
-                        SymExpr::Mul(
-                            Box::new(SymExpr::Sub(e1a.clone(), e2a.clone())),
-                            Box::new(*e1b.clone()),
-                        )
-                    }
-                    (SymExpr::Const(c1), SymExpr::Const(c2)) => SymExpr::Const(c1 - c2),
-                    _ => SymExpr::Sub(Box::new(se1), Box::new(se2)),
-                }
-            }
-            SymExpr::Mul(e1, e2) => {
-                let se1 = e1.simplify();
-                let se2 = e2.simplify();
-                match (&se1, &se2) {
-                    (SymExpr::Const(0.0), _) | (_, SymExpr::Const(0.0)) => SymExpr::Const(0.0),
-                    (SymExpr::Const(1.0), _) => se2,
-                    (_, SymExpr::Const(1.0)) => se1,
-                    (SymExpr::Const(c1), SymExpr::Const(c2)) => SymExpr::Const(c1 * c2),
-                    (SymExpr::Powi(base1, exp1), SymExpr::Powi(base2, exp2)) if base1 == base2 => {
-                        SymExpr::Powi(base1.clone(), exp1 + exp2)
-                    } // base^a * base^b = base^(a+b)
-                    (SymExpr::Exp(e1), SymExpr::Exp(e2)) => {
-                        SymExpr::Exp(Box::new(SymExpr::Add(e1.clone(), e2.clone())))
-                    } // exp(a) * exp(b) = exp(a + b)
-                    _ => SymExpr::Mul(Box::new(se1), Box::new(se2)),
-                }
-            }
-            SymExpr::Div(e1, e2) => {
-                let se1 = e1.simplify();
-                let se2 = e2.simplify();
-                match (&se1, &se2) {
-                    (SymExpr::Const(c1), SymExpr::Const(c2)) if *c2 != 0.0 => {
-                        SymExpr::Const(c1 / c2)
-                    }
-                    (SymExpr::Const(0.0), _) => SymExpr::Const(0.0),
-                    (_, SymExpr::Const(1.0)) => se1,
-                    (SymExpr::Powi(base1, exp1), SymExpr::Powi(base2, exp2)) if base1 == base2 => {
-                        SymExpr::Powi(base1.clone(), exp1 - exp2)
-                    } // base^a / base^b = base^(a-b)
-                    (SymExpr::Exp(e1), SymExpr::Exp(e2)) => {
-                        SymExpr::Exp(Box::new(SymExpr::Sub(e1.clone(), e2.clone())))
-                    } // exp(a) / exp(b) = exp(a - b)
-                    _ => SymExpr::Div(Box::new(se1), Box::new(se2)),
-                }
-            }
-            SymExpr::Powi(e, exp) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) => SymExpr::Const(c.powi(*exp)),
-                    _ => SymExpr::Powi(Box::new(se), *exp),
-                }
-            }
-            SymExpr::Neg(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) => SymExpr::Const(-c),
-                    SymExpr::Neg(inner) => *inner.clone(), // --e = e
-                    _ => SymExpr::Neg(Box::new(se)),
-                }
-            }
-            SymExpr::Sin(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) => SymExpr::Const(c.sin()),
-                    _ => SymExpr::Sin(Box::new(se)),
-                }
-            }
-            SymExpr::Cos(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) => SymExpr::Const(c.cos()),
-                    _ => SymExpr::Cos(Box::new(se)),
-                }
-            }
-            SymExpr::Ln(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) if *c > 0.0 => SymExpr::Const(c.ln()),
-                    SymExpr::Powi(base, exp) => SymExpr::Mul(
-                        Box::new(SymExpr::Const(*exp as f64)),
-                        Box::new(SymExpr::Ln(base.clone())),
-                    ), // ln(base^exp) = exp * ln(base)
-                    _ => SymExpr::Ln(Box::new(se)),
-                }
-            }
-            SymExpr::Exp(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) => SymExpr::Const(c.exp()),
-                    _ => SymExpr::Exp(Box::new(se)),
-                }
-            }
-            SymExpr::Sqrt(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) if *c >= 0.0 => SymExpr::Const(c.sqrt()),
-                    SymExpr::Powi(base, exp) if *exp % 2 == 0 => {
-                        // sqrt(base^(2k)) = base^k
-                        SymExpr::Powi(base.clone(), *exp / 2)
-                    }
-                    _ => SymExpr::Sqrt(Box::new(se)),
-                }
-            }
-            SymExpr::Opaque(e) => SymExpr::Opaque(e.clone()),
+/// An interning arena for [`SymNode`]s.
+///
+/// Nodes are stored in a flat `Vec` and looked up by index ([`NodeId`]).
+/// [`SymArena::intern`] guarantees that each structurally distinct node is
+/// stored at most once, so two equal nodes always get the same `NodeId`.
+pub struct SymArena {
+    nodes: Vec<SymNode>,
+    lookup: HashMap<SymNode, usize>,
+}
+
+impl SymArena {
+    /// Create an empty arena.
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            lookup: HashMap::new(),
         }
     }
 
-    /// Repeatedly call [`simplify`](Self::simplify) until the expression stops changing or
-    /// `max_passes` iterations are reached (default: [`DEFAULT_MAX_PASSES`]).
-    ///
-    /// A single pass of `simplify` rewrites the tree bottom-up, so some identities
-    /// (e.g. constant folding inside a newly-simplified sub-expression) may only
-    /// become visible after the parent is revisited.  Multiple passes converge to
-    /// a fixed point for all rules currently implemented.
-    pub fn simplify_multipass(&self, max_passes: Option<usize>) -> Self {
-        let mut simplified = self.clone();
-        let max_passes = max_passes.unwrap_or(DEFAULT_MAX_PASSES);
-        for _ in 0..max_passes {
-            let new_simplified = simplified.simplify();
-            if new_simplified == simplified {
-                break;
-            }
-            simplified = new_simplified;
-        }
-        simplified
+    /// Return a reference to the node stored at `node_id`.
+    pub fn get_node(&self, node_id: NodeId) -> &SymNode {
+        &self.nodes[node_id]
     }
 
-    /// Symbolically differentiate with respect to parameter index `var`.
-    ///
-    /// Applies the standard differentiation rules:
-    /// - **Sum rule**: `(f ± g)' = f' ± g'`
-    /// - **Product rule**: `(fg)' = f'g + fg'`
-    /// - **Quotient rule**: `(f/g)' = f'/g - fg'/g²`
-    /// - **Power rule**: `(fⁿ)' = n·fⁿ⁻¹·f'`
-    /// - **Chain rule**: applied to sin, cos, ln, exp, sqrt
-    ///
-    /// [`Opaque`](SymExpr::Opaque) sub-expressions are treated as constants
-    /// (derivative = 0).  See the variant's documentation for the implications.
-    pub fn diff(&self, var: String) -> Self {
-        match self {
-            SymExpr::Const(_) => SymExpr::Const(0.0),
-            SymExpr::Var(name, i) => {
-                if format!("{}[{}]", name, i) == var {
-                    SymExpr::Const(1.0)
-                } else {
-                    SymExpr::Const(0.0)
-                }
-            }
-            SymExpr::Add(e1, e2) => SymExpr::Add(
-                Box::new(e1.diff(var.clone())),
-                Box::new(e2.diff(var.clone())),
-            ),
-            SymExpr::Sub(e1, e2) => SymExpr::Sub(
-                Box::new(e1.diff(var.clone())),
-                Box::new(e2.diff(var.clone())),
-            ),
-            // Product rule: (e1*e2)' = e1'*e2 + e1*e2'
-            SymExpr::Mul(e1, e2) => SymExpr::Add(
-                Box::new(SymExpr::Mul(Box::new(e1.diff(var.clone())), e2.clone())),
-                Box::new(SymExpr::Mul(e1.clone(), Box::new(e2.diff(var.clone())))),
-            ),
-            // Quotient rule: (e1/e2)' = e1'/e2 - e1*e2'/e2²
-            SymExpr::Div(e1, e2) => SymExpr::Sub(
-                Box::new(SymExpr::Div(Box::new(e1.diff(var.clone())), e2.clone())),
-                Box::new(SymExpr::Div(
-                    Box::new(SymExpr::Mul(e1.clone(), Box::new(e2.diff(var.clone())))),
-                    Box::new(SymExpr::Powi(e2.clone(), 2)),
-                )),
-            ),
-            // Power rule: (base^n)' = n * base^(n-1) * base'
-            SymExpr::Powi(e1, exp) => {
-                if *exp == 0 {
-                    SymExpr::Const(0.0)
-                } else if let SymExpr::Const(_) = **e1 {
-                    // (c^n)' = 0
-                    SymExpr::Const(0.0)
-                } else {
-                    let new_exp = *exp - 1;
-                    let coeff = *exp as f64;
-                    SymExpr::Mul(
-                        Box::new(SymExpr::Mul(
-                            Box::new(SymExpr::Const(coeff)),
-                            Box::new(SymExpr::Powi(e1.clone(), new_exp)),
-                        )),
-                        Box::new(e1.diff(var)),
-                    )
-                }
-            }
-            SymExpr::Neg(e) => SymExpr::Neg(Box::new(e.diff(var))),
-            // sin'(e) = cos(e) * e'
-            SymExpr::Sin(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) => SymExpr::Const(c.cos()),
-                    _ => SymExpr::Mul(Box::new(SymExpr::Cos(Box::new(se))), Box::new(e.diff(var))),
-                }
-            }
-            // cos'(e) = -sin(e) * e'
-            SymExpr::Cos(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) => SymExpr::Const(-c.sin()),
-                    _ => SymExpr::Mul(
-                        Box::new(SymExpr::Mul(
-                            Box::new(SymExpr::Const(-1.0)),
-                            Box::new(SymExpr::Sin(Box::new(se))),
-                        )),
-                        Box::new(e.diff(var)),
-                    ),
-                }
-            }
-            // ln'(e) = e' / e
-            SymExpr::Ln(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) if *c > 0.0 => SymExpr::Const(1.0 / c),
-                    _ => SymExpr::Div(Box::new(e.diff(var)), Box::new(se)),
-                }
-            }
-            // exp'(e) = exp(e) * e'
-            SymExpr::Exp(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) => SymExpr::Const(c.exp()),
-                    _ => SymExpr::Mul(Box::new(SymExpr::Exp(Box::new(se))), Box::new(e.diff(var))),
-                }
-            }
-            // sqrt'(e) = e' / (2 * sqrt(e))
-            SymExpr::Sqrt(e) => {
-                let se = e.simplify();
-                match &se {
-                    SymExpr::Const(c) if *c >= 0.0 => SymExpr::Const(0.5 / c.sqrt()),
-                    _ => SymExpr::Div(
-                        Box::new(e.diff(var)),
-                        Box::new(SymExpr::Mul(
-                            Box::new(SymExpr::Sqrt(Box::new(se))),
-                            Box::new(SymExpr::Const(2.0)),
-                        )),
-                    ),
-                }
-            }
-            SymExpr::Opaque(_) => SymExpr::Const(0.0),
+    /// Dispatch `node_id` to the matching `visitor` method and return the result.
+    pub fn accept<V, T>(&self, node_id: NodeId, visitor: &mut V) -> T
+    where
+        V: SymVisitor<T>,
+    {
+        let node = &self.nodes[node_id];
+        match node {
+            SymNode::Const(value) => visitor.visit_const(*value, self),
+            SymNode::Var(idx) => visitor.visit_var(*idx, self),
+            SymNode::Add(left, right) => visitor.visit_add(*left, *right, self),
+            SymNode::Sub(left, right) => visitor.visit_sub(*left, *right, self),
+            SymNode::Mul(left, right) => visitor.visit_mul(*left, *right, self),
+            SymNode::Div(left, right) => visitor.visit_div(*left, *right, self),
+            SymNode::Powi(base, exp) => visitor.visit_powi(*base, *exp, self),
+            SymNode::Neg(operand) => visitor.visit_neg(*operand, self),
+            SymNode::Sin(operand) => visitor.visit_sin(*operand, self),
+            SymNode::Cos(operand) => visitor.visit_cos(*operand, self),
+            SymNode::Ln(operand) => visitor.visit_ln(*operand, self),
+            SymNode::Exp(operand) => visitor.visit_exp(*operand, self),
+            SymNode::Sqrt(operand) => visitor.visit_sqrt(*operand, self),
         }
     }
 
-    /// Emit this expression as a [`proc_macro2::TokenStream`] suitable for
-    /// splicing into generated code.
+    /// Insert `node` into the arena, returning its `NodeId`.
     ///
-    /// [`Var(name, i)`](SymExpr::Var) nodes emit `name[i]`, matching the slice
-    /// parameter in the annotated function.  [`Const`](SymExpr::Const) values are
-    /// emitted as `f64`-suffixed literals (e.g. `3f64`) to avoid type-inference
-    /// failures in the generated function body.
-    pub fn into_token_stream(self) -> TokenStream {
-        match self {
-            SymExpr::Const(c) => {
-                let lit = proc_macro2::Literal::f64_suffixed(c);
-                quote! { #lit }
-            }
-            SymExpr::Var(name, i) => {
-                let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
-                let idx = i as usize;
-                quote! { #ident[#idx] }
-            }
-            SymExpr::Add(e1, e2) => {
-                let ts1 = e1.into_token_stream();
-                let ts2 = e2.into_token_stream();
-                quote! { (#ts1 + #ts2) }
-            }
-            SymExpr::Sub(e1, e2) => {
-                let ts1 = e1.into_token_stream();
-                let ts2 = e2.into_token_stream();
-                quote! { (#ts1 - #ts2) }
-            }
-            SymExpr::Mul(e1, e2) => {
-                let ts1 = e1.into_token_stream();
-                let ts2 = e2.into_token_stream();
-                quote! { (#ts1 * #ts2) }
-            }
-            SymExpr::Div(e1, e2) => {
-                let ts1 = e1.into_token_stream();
-                let ts2 = e2.into_token_stream();
-                quote! { (#ts1 / #ts2) }
-            }
-            SymExpr::Powi(e, exp) => {
-                let ts = e.into_token_stream();
-                quote! { (#ts).powi(#exp) }
-            }
-            SymExpr::Neg(e) => {
-                let ts = e.into_token_stream();
-                quote! { -(#ts) }
-            }
-            SymExpr::Sin(e) => {
-                let ts = e.into_token_stream();
-                quote! { (#ts).sin() }
-            }
-            SymExpr::Cos(e) => {
-                let ts = e.into_token_stream();
-                quote! { (#ts).cos() }
-            }
-            SymExpr::Ln(e) => {
-                let ts = e.into_token_stream();
-                quote! { (#ts).ln() }
-            }
-            SymExpr::Exp(e) => {
-                let ts = e.into_token_stream();
-                quote! { (#ts).exp() }
-            }
-            SymExpr::Sqrt(e) => {
-                let ts = e.into_token_stream();
-                quote! { (#ts).sqrt() }
-            }
-            SymExpr::Opaque(ts) => ts.into_token_stream(),
+    /// If an identical node already exists, its existing id is returned instead
+    /// (hash-consing / structural sharing).
+    pub fn intern(&mut self, node: SymNode) -> usize {
+        if let Some(&idx) = self.lookup.get(&node) {
+            idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(node.clone());
+            self.lookup.insert(node, idx);
+            idx
         }
+    }
+
+    /// Apply `transformer` to every node reachable from `root` in bottom-up
+    /// topological order, returning the new `NodeId` that corresponds to `root`.
+    ///
+    /// `diff` is an *output* parameter populated by the caller (pass an empty
+    /// `HashMap`).  On return it maps each original `NodeId` to the transformed
+    /// `NodeId` produced by the transformer.
+    fn transform<T: SymTransformer>(
+        &mut self,
+        root: NodeId,
+        transformer: &T,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let order = self.get_topological_order(root);
+
+        let mut diff_map = HashMap::new();
+
+        for i in order {
+            let node = self.nodes[i];
+            let diff = match node {
+                SymNode::Const(value) => transformer.process_const(value, self, &mut diff_map),
+                SymNode::Var(idx) => transformer.process_var(idx, self, &mut diff_map),
+                SymNode::Add(left, right) => {
+                    transformer.process_add(left, right, self, &mut diff_map)
+                }
+                SymNode::Sub(left, right) => {
+                    transformer.process_sub(left, right, self, &mut diff_map)
+                }
+                SymNode::Mul(left, right) => {
+                    transformer.process_mul(left, right, self, &mut diff_map)
+                }
+                SymNode::Div(left, right) => {
+                    transformer.process_div(left, right, self, &mut diff_map)
+                }
+                SymNode::Powi(base, exp) => {
+                    transformer.process_powi(base, exp, self, &mut diff_map)
+                }
+                SymNode::Neg(operand) => transformer.process_neg(operand, self, &mut diff_map),
+                SymNode::Sin(operand) => transformer.process_sin(operand, self, &mut diff_map),
+                SymNode::Cos(operand) => transformer.process_cos(operand, self, &mut diff_map),
+                SymNode::Ln(operand) => transformer.process_ln(operand, self, &mut diff_map),
+                SymNode::Exp(operand) => transformer.process_exp(operand, self, &mut diff_map),
+                SymNode::Sqrt(operand) => transformer.process_sqrt(operand, self, &mut diff_map),
+            };
+            diff_map.insert(i, diff);
+        }
+
+        diff_map[&root]
+    }
+
+    /// Return the nodes reachable from `root_id` in bottom-up (post-order)
+    /// topological order, visiting each node exactly once.
+    pub fn get_topological_order(&self, root_id: NodeId) -> Vec<NodeId> {
+        let mut visited = HashSet::new();
+        let mut order = Vec::new();
+        let mut stack = vec![(root_id, false)];
+
+        while let Some((node_id, visited_children)) = stack.pop() {
+            // Check if all children have been visited
+            if visited_children {
+                order.push(node_id);
+            } else if visited.insert(node_id) {
+                // Otherwise we need to add children first
+                let node = &self.nodes[node_id];
+                stack.push((node_id, true));
+                // Add children
+                match node {
+                    SymNode::Const(_) | SymNode::Var(_) => {}
+                    SymNode::Add(left, right)
+                    | SymNode::Sub(left, right)
+                    | SymNode::Mul(left, right)
+                    | SymNode::Div(left, right) => {
+                        stack.push((*left, false));
+                        stack.push((*right, false));
+                    }
+                    SymNode::Powi(base, _)
+                    | SymNode::Neg(base)
+                    | SymNode::Sin(base)
+                    | SymNode::Cos(base)
+                    | SymNode::Ln(base)
+                    | SymNode::Exp(base)
+                    | SymNode::Sqrt(base) => {
+                        stack.push((*base, false));
+                    }
+                }
+            }
+        }
+
+        order
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// syn::Expr → SymExpr
-// ─────────────────────────────────────────────────────────────────────────────
+/// A rewriting pass over the expression tree.
+///
+/// [`SymArena::transform`] calls one method per node in bottom-up topological
+/// order.  Each method receives the original child `NodeId`s plus a `diff` map
+/// that already contains the transformed ids for every child; implementors look
+/// up `diff[&child_id]` to obtain the rewritten child before building the new
+/// node.  The returned `NodeId` is then recorded in `diff` under the current
+/// node's id so parent nodes can find it in turn.
+pub trait SymTransformer {
+    fn process_const(
+        &self,
+        value: u64,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_var(
+        &self,
+        idx: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_add(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_sub(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_mul(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_div(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_powi(
+        &self,
+        base: NodeId,
+        exp: i32,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_neg(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_sin(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_cos(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_ln(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_exp(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+    fn process_sqrt(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId;
+}
 
-/// Convert a parsed [`syn::Expr`] into a [`SymExpr`].
+/// A read-only visitor over the expression tree.
 ///
-/// `bindings` maps local names to their symbolic form and is used to inline
-/// `let`-bindings encountered earlier in the function body.  Slice indexing
-/// (`x[i]`) is recognised as [`SymExpr::Var`]; identifiers present in
-/// `bindings` are substituted; everything else becomes [`SymExpr::Opaque`].
+/// [`SymArena::accept`] dispatches to the method matching the node kind.
+/// Unlike [`SymTransformer`], the visitor is responsible for recursing into
+/// children itself (by calling `arena.accept(child_id, self)`) if it needs
+/// their values.
+pub trait SymVisitor<T> {
+    fn visit_const(&mut self, value: u64, arena: &SymArena) -> T;
+    fn visit_var(&mut self, idx: NodeId, arena: &SymArena) -> T;
+    fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> T;
+    fn visit_sub(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> T;
+    fn visit_mul(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> T;
+    fn visit_div(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> T;
+    fn visit_powi(&mut self, base: NodeId, exp: i32, arena: &SymArena) -> T;
+    fn visit_neg(&mut self, operand: NodeId, arena: &SymArena) -> T;
+    fn visit_sin(&mut self, operand: NodeId, arena: &SymArena) -> T;
+    fn visit_cos(&mut self, operand: NodeId, arena: &SymArena) -> T;
+    fn visit_ln(&mut self, operand: NodeId, arena: &SymArena) -> T;
+    fn visit_exp(&mut self, operand: NodeId, arena: &SymArena) -> T;
+    fn visit_sqrt(&mut self, operand: NodeId, arena: &SymArena) -> T;
+}
+
+/// A [`SymTransformer`] that computes the symbolic derivative of every node
+/// with respect to a single variable `var` (identified by its [`NodeId`]).
 ///
-/// # Supported syntax
+/// The rules applied are the standard calculus identities: sum rule, product
+/// rule, quotient rule, power rule, and chain rule for each transcendental.
+struct DiffTransformer {
+    /// The variable we are differentiating with respect to.
+    var: NodeId,
+}
+
+impl DiffTransformer {
+    pub fn new(var: NodeId) -> DiffTransformer {
+        DiffTransformer { var }
+    }
+}
+
+impl SymTransformer for DiffTransformer {
+    fn process_const(
+        &self,
+        value: u64,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Derivative of a constant is zero
+        arena.intern(SymNode::Const(0))
+    }
+
+    fn process_var(
+        &self,
+        idx: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        if idx == self.var {
+            // Derivative of the variable with respect to itself is one
+            arena.intern(SymNode::Const(1.0_f64.to_bits()))
+        } else {
+            // Derivative of other variables is zero
+            arena.intern(SymNode::Const(0.0_f64.to_bits()))
+        }
+    }
+
+    fn process_add(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_diff = diff[&left];
+        let right_diff = diff[&right];
+        arena.intern(SymNode::Add(left_diff, right_diff))
+    }
+
+    fn process_sub(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_diff = diff[&left];
+        let right_diff = diff[&right];
+        arena.intern(SymNode::Sub(left_diff, right_diff))
+    }
+
+    fn process_mul(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_diff = diff[&left];
+        let right_diff = diff[&right];
+
+        // Product rule: (f * g)' = f' * g + f * g'
+        let term1 = arena.intern(SymNode::Mul(left_diff, right));
+        let term2 = arena.intern(SymNode::Mul(left, right_diff));
+        arena.intern(SymNode::Add(term1, term2))
+    }
+
+    fn process_div(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_diff = diff[&left];
+        let right_diff = diff[&right];
+
+        // Quotient rule: (f / g)' = (f' * g - f * g') / (g * g)
+        let numerator1 = arena.intern(SymNode::Mul(left_diff, right));
+        let numerator2 = arena.intern(SymNode::Mul(left, right_diff));
+        let numerator = arena.intern(SymNode::Sub(numerator1, numerator2));
+        let denominator = arena.intern(SymNode::Mul(right, right));
+        arena.intern(SymNode::Div(numerator, denominator))
+    }
+
+    fn process_powi(
+        &self,
+        base: NodeId,
+        exp: i32,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let base_diff = diff[&base];
+        // Power rule: (f^n)' = n * f^(n-1) * f'
+        let exp_node = arena.intern(SymNode::Const((exp as f64).to_bits()));
+        let pow_node = arena.intern(SymNode::Powi(base, exp - 1));
+        let term = arena.intern(SymNode::Mul(exp_node, pow_node));
+        arena.intern(SymNode::Mul(term, base_diff))
+    }
+
+    fn process_neg(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_diff = diff[&operand];
+        arena.intern(SymNode::Neg(operand_diff))
+    }
+
+    fn process_sin(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Chain rule: (sin(f))' = cos(f) * f'
+        let operand_diff = diff[&operand];
+        let cos_operand = arena.intern(SymNode::Cos(operand));
+        arena.intern(SymNode::Mul(operand_diff, cos_operand))
+    }
+
+    fn process_cos(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Chain rule: (cos(f))' = -sin(f) * f'
+        let operand_diff = diff[&operand];
+        let sin_operand = arena.intern(SymNode::Sin(operand));
+        let neg_sin_operand = arena.intern(SymNode::Neg(sin_operand));
+        arena.intern(SymNode::Mul(operand_diff, neg_sin_operand))
+    }
+
+    fn process_exp(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Chain rule: (exp(f))' = exp(f) * f'
+        let operand_diff = diff[&operand];
+        let exp_operand = arena.intern(SymNode::Exp(operand));
+        arena.intern(SymNode::Mul(operand_diff, exp_operand))
+    }
+
+    fn process_ln(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Chain rule: (ln(f))' = f' / f
+        let operand_diff = diff[&operand];
+        arena.intern(SymNode::Div(operand_diff, operand))
+    }
+
+    fn process_sqrt(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Chain rule: (sqrt(f))' = f' / (2 * sqrt(f))
+        let operand_diff = diff[&operand];
+        let sqrt_operand = arena.intern(SymNode::Sqrt(operand));
+        let two = arena.intern(SymNode::Const(2.0_f64.to_bits()));
+        let denominator = arena.intern(SymNode::Mul(two, sqrt_operand));
+        arena.intern(SymNode::Div(operand_diff, denominator))
+    }
+}
+
+/// A [`SymTransformer`] that algebraically simplifies an expression tree.
 ///
-/// | Source form | Result |
-/// |---|---|
-/// | `1.0`, `2` | [`Const`](SymExpr::Const) |
-/// | `x[i]` | [`Var("x", i)`](SymExpr::Var) |
-/// | `a` (in bindings) | substituted [`SymExpr`] |
-/// | `e + f`, `e - f`, `e * f`, `e / f` | [`Add`](SymExpr::Add) / [`Sub`](SymExpr::Sub) / [`Mul`](SymExpr::Mul) / [`Div`](SymExpr::Div) |
-/// | `-e` | [`Neg`](SymExpr::Neg) |
-/// | `e.sin()`, `e.cos()`, `e.ln()`, `e.exp()`, `e.sqrt()` | trig/transcendental nodes |
-/// | `e.powi(n)` (const `n`) | [`Powi`](SymExpr::Powi) |
-/// | `(e)`, `e as f64` | transparent — inner expr used |
-/// | anything else | [`Opaque`](SymExpr::Opaque) |
-pub(super) fn syn_to_sym(expr: &Expr, bindings: &HashMap<String, SymExpr>) -> SymExpr {
+/// Each `process_*` method receives the already-simplified child ids (via the
+/// `diff` map) and applies a set of local rewrite rules before rebuilding the
+/// node.  Rules include:
+///
+/// - **Constant folding**: if all operands are `Const`, evaluate the operation
+///   at compile time and return a single `Const`.
+/// - **Identity / annihilator laws**: `0 + e = e`, `e * 1 = e`, `0 * e = 0`,
+///   `0 / e = 0`, `e / 1 = e`, `0 - e = -e`, `e - 0 = e`.
+/// - **Double negation**: `-(-e) = e`.
+/// - **Distributive factoring for `+`/`-`**: `a*b ± a*c = a*(b ± c)`.
+/// - **Power merging**: `b^m * b^n = b^(m+n)`, `b^m / b^n = b^(m-n)`.
+/// - **Exponential merging**: `exp(a) * exp(b) = exp(a+b)`,
+///   `exp(a) / exp(b) = exp(a-b)`.
+/// - **Logarithm of a power**: `ln(b^n) = n * ln(b)`.
+/// - **Square root of an even power**: `sqrt(b^(2k)) = b^k`.
+struct SimplifyTransformer {}
+
+impl SimplifyTransformer {
+    pub fn new() -> SimplifyTransformer {
+        SimplifyTransformer {}
+    }
+}
+
+impl SymTransformer for SimplifyTransformer {
+    fn process_const(
+        &self,
+        value: u64,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Constants are already simplified
+        arena.intern(SymNode::Const(value))
+    }
+
+    fn process_var(
+        &self,
+        idx: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Variables are already simplified
+        arena.intern(SymNode::Var(idx))
+    }
+
+    fn process_add(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        // Simplify addition
+        let left_id = diff[&left];
+        let right_id = diff[&right];
+        let left_node = arena.nodes[left_id];
+        let right_node = arena.nodes[right_id];
+
+        match (left_node, right_node) {
+            (SymNode::Const(value1), SymNode::Const(value2)) => {
+                // Constant folding: if both sides are constants, evaluate them
+                let v1_bits = f64::from_bits(value1);
+                let v2_bits = f64::from_bits(value2);
+                let result_value = (v1_bits + v2_bits).to_bits();
+                return arena.intern(SymNode::Const(result_value));
+            }
+            (SymNode::Const(v), _) if v == 0.0_f64.to_bits() => {
+                // 0 + e = e
+                return right_id;
+            }
+            (_, SymNode::Const(v)) if v == 0.0_f64.to_bits() => {
+                // e + 0 = e
+                return left_id;
+            }
+            (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1a == e2a => {
+                // (a*b) + (a*c) = a * (b+c)
+                let factored = arena.intern(SymNode::Add(e1b, e2b));
+                return arena.intern(SymNode::Mul(e1a, factored));
+            }
+            (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1a == e2b => {
+                // (a*b) + (c*a) = a * (b+c)
+                let factored = arena.intern(SymNode::Add(e1b, e2a));
+                return arena.intern(SymNode::Mul(e1a, factored));
+            }
+            (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1b == e2a => {
+                // (b*a) + (a*c) = a * (b+c)
+                let factored = arena.intern(SymNode::Add(e1a, e2b));
+                return arena.intern(SymNode::Mul(e1b, factored));
+            }
+            (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1b == e2b => {
+                // (b*a) + (c*a) = a * (b+c)
+                let factored = arena.intern(SymNode::Add(e1a, e2a));
+                return arena.intern(SymNode::Mul(e1b, factored));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Add(left_id, right_id))
+    }
+
+    fn process_sub(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_id = diff[&left];
+        let right_id = diff[&right];
+        let left_node = arena.nodes[left_id];
+        let right_node = arena.nodes[right_id];
+
+        match (left_node, right_node) {
+            (SymNode::Const(value1), SymNode::Const(value2)) => {
+                // Constant folding: if both sides are constants, evaluate them
+                let v1_bits = f64::from_bits(value1);
+                let v2_bits = f64::from_bits(value2);
+                let result_value = (v1_bits - v2_bits).to_bits();
+                return arena.intern(SymNode::Const(result_value));
+            }
+            (SymNode::Const(v), _) if v == 0.0_f64.to_bits() => {
+                // 0 - e = -e
+                return arena.intern(SymNode::Neg(right_id));
+            }
+            (_, SymNode::Const(v)) if v == 0.0_f64.to_bits() => {
+                // e - 0 = e
+                return left_id;
+            }
+            (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1a == e2a => {
+                // (a*b) - (a*c) = a * (b-c)
+                let factored = arena.intern(SymNode::Sub(e1b, e2b));
+                return arena.intern(SymNode::Mul(e1a, factored));
+            }
+            (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1a == e2b => {
+                // (a*b) - (c*a) = a * (b-c)
+                let factored = arena.intern(SymNode::Sub(e1b, e2a));
+                return arena.intern(SymNode::Mul(e1a, factored));
+            }
+            (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1b == e2a => {
+                // (b*a) - (a*c) = a * (b-c)
+                let factored = arena.intern(SymNode::Sub(e1a, e2b));
+                return arena.intern(SymNode::Mul(e1b, factored));
+            }
+            (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1b == e2b => {
+                // (b*a) - (c*a) = a * (b-c)
+                let factored = arena.intern(SymNode::Sub(e1a, e2a));
+                return arena.intern(SymNode::Mul(e1b, factored));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Sub(left_id, right_id))
+    }
+
+    fn process_mul(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_id = diff[&left];
+        let right_id = diff[&right];
+        let left_node = arena.nodes[left_id];
+        let right_node = arena.nodes[right_id];
+
+        match (left_node, right_node) {
+            (SymNode::Const(value1), SymNode::Const(value2)) => {
+                // Constant folding: if both sides are constants, evaluate them
+                let v1_bits = f64::from_bits(value1);
+                let v2_bits = f64::from_bits(value2);
+                let result_value = (v1_bits * v2_bits).to_bits();
+                return arena.intern(SymNode::Const(result_value));
+            }
+            (SymNode::Const(v), _) | (_, SymNode::Const(v)) if v == 0.0_f64.to_bits() => {
+                // 0 * e = 0, e * 0 = 0
+                return arena.intern(SymNode::Const(0.0_f64.to_bits()));
+            }
+            (SymNode::Const(v), _) if v == 1.0_f64.to_bits() => {
+                // 1 * e = e
+                return right_id;
+            }
+            (_, SymNode::Const(v)) if v == 1.0_f64.to_bits() => {
+                // e * 1 = e
+                return left_id;
+            }
+            (SymNode::Powi(base1, exp1), SymNode::Powi(base2, exp2)) if base1 == base2 => {
+                // base^a * base^b = base^(a+b)
+                let new_exp = exp1 + exp2;
+                return arena.intern(SymNode::Powi(base1, new_exp));
+            }
+            (SymNode::Exp(e1), SymNode::Exp(e2)) => {
+                // exp(a) * exp(b) = exp(a+b)
+                let new_exp = arena.intern(SymNode::Add(e1, e2));
+                return arena.intern(SymNode::Exp(new_exp));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Mul(left_id, right_id))
+    }
+
+    fn process_div(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_id = diff[&left];
+        let right_id = diff[&right];
+        let left_node = arena.nodes[left_id];
+        let right_node = arena.nodes[right_id];
+
+        match (left_node, right_node) {
+            (SymNode::Const(value1), SymNode::Const(value2)) if value2 != 0.0_f64.to_bits() => {
+                // Constant folding: if both sides are constants, evaluate them
+                let v1_bits = f64::from_bits(value1);
+                let v2_bits = f64::from_bits(value2);
+                let result_value = (v1_bits / v2_bits).to_bits();
+                return arena.intern(SymNode::Const(result_value));
+            }
+            (SymNode::Const(v), _) if v == 0.0_f64.to_bits() => {
+                // 0 / e = 0
+                return arena.intern(SymNode::Const(0.0_f64.to_bits()));
+            }
+            (_, SymNode::Const(v)) if v == 1.0_f64.to_bits() => {
+                // e / 1 = e
+                return left_id;
+            }
+            (SymNode::Exp(e1), SymNode::Exp(e2)) => {
+                // exp(a) / exp(b) = exp(a-b)
+                let new_exp = arena.intern(SymNode::Sub(e1, e2));
+                return arena.intern(SymNode::Exp(new_exp));
+            }
+            (SymNode::Powi(base1, exp1), SymNode::Powi(base2, exp2)) if base1 == base2 => {
+                // base^a / base^b = base^(a-b)
+                let new_exp = exp1 - exp2;
+                return arena.intern(SymNode::Powi(base1, new_exp));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Div(left_id, right_id))
+    }
+
+    fn process_powi(
+        &self,
+        base: NodeId,
+        exp: i32,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let base_id = diff[&base];
+        let base_node = arena.nodes[base_id];
+
+        match base_node {
+            SymNode::Const(value) => {
+                // Constant folding: if the base is a constant, evaluate it
+                let base_value = f64::from_bits(value);
+                let result_value = base_value.powi(exp).to_bits();
+                return arena.intern(SymNode::Const(result_value));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Powi(base_id, exp))
+    }
+
+    fn process_neg(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = diff[&operand];
+        let operand_node = arena.nodes[operand_id];
+
+        match operand_node {
+            SymNode::Const(value) => {
+                // -c = (-c) for constants
+                let c = f64::from_bits(value);
+                let neg_c = -c;
+                return arena.intern(SymNode::Const(neg_c.to_bits()));
+            }
+            SymNode::Neg(inner) => {
+                // --e = e
+                return inner;
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Neg(operand_id))
+    }
+
+    fn process_sin(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = diff[&operand];
+        let operand_node = arena.nodes[operand_id];
+
+        match operand_node {
+            SymNode::Const(value) => {
+                // sin(c) = c.sin() for constants
+                let c = f64::from_bits(value);
+                let sin_c = c.sin();
+                return arena.intern(SymNode::Const(sin_c.to_bits()));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Sin(operand_id))
+    }
+
+    fn process_cos(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = diff[&operand];
+        let operand_node = arena.nodes[operand_id];
+
+        match operand_node {
+            SymNode::Const(value) => {
+                // cos(c) = c.cos() for constants
+                let c = f64::from_bits(value);
+                let cos_c = c.cos();
+                return arena.intern(SymNode::Const(cos_c.to_bits()));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Cos(operand_id))
+    }
+
+    fn process_ln(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = diff[&operand];
+        let operand_node = arena.nodes[operand_id];
+
+        match operand_node {
+            SymNode::Const(value) => {
+                // ln(c) = c.ln() for positive constants
+                let c = f64::from_bits(value);
+                if c > 0.0 {
+                    let ln_c = c.ln();
+                    return arena.intern(SymNode::Const(ln_c.to_bits()));
+                }
+            }
+            SymNode::Powi(base, exp) => {
+                // ln(base^exp) = exp * ln(base)
+                let ln_base = arena.intern(SymNode::Ln(base));
+                let exp_node = arena.intern(SymNode::Const((exp as f64).to_bits()));
+                return arena.intern(SymNode::Mul(exp_node, ln_base));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Ln(operand_id))
+    }
+
+    fn process_exp(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = diff[&operand];
+        let operand_node = arena.nodes[operand_id];
+
+        match operand_node {
+            SymNode::Const(value) => {
+                // exp(c) = c.exp() for constants
+                let c = f64::from_bits(value);
+                let exp_c = c.exp();
+                return arena.intern(SymNode::Const(exp_c.to_bits()));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Exp(operand_id))
+    }
+
+    fn process_sqrt(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = diff[&operand];
+        let operand_node = arena.nodes[operand_id];
+
+        match operand_node {
+            SymNode::Const(value) => {
+                // sqrt(c) = c.sqrt() for positive constants
+                let c = f64::from_bits(value);
+                if c >= 0.0 {
+                    let sqrt_c = c.sqrt();
+                    return arena.intern(SymNode::Const(sqrt_c.to_bits()));
+                }
+            }
+            SymNode::Powi(base, exp) if exp % 2 == 0 => {
+                // sqrt(base^(2k)) = base^k
+                let new_exp = exp / 2;
+                return arena.intern(SymNode::Powi(base, new_exp));
+            }
+            _ => {}
+        }
+        arena.intern(SymNode::Sqrt(operand_id))
+    }
+}
+
+/// A [`SymVisitor`] that counts how many times each [`NodeId`] is referenced
+/// in the sub-tree rooted at the visited node.
+///
+/// The resulting counts are used by [`ToTokenStreamVisitor`] to decide which
+/// sub-expressions are worth hoisting into a `let` binding for common
+/// sub-expression elimination (CSE).
+struct RefCountVisitor<'a> {
+    arena: &'a SymArena,
+    counts: HashMap<NodeId, usize>,
+}
+
+impl RefCountVisitor<'_> {
+    pub fn new(arena: &'_ SymArena) -> RefCountVisitor<'_> {
+        RefCountVisitor {
+            arena,
+            counts: HashMap::new(),
+        }
+    }
+
+    /// Return the reference-count map populated during the walk.
+    pub fn get_counts(&self) -> &HashMap<NodeId, usize> {
+        &self.counts
+    }
+}
+
+impl SymVisitor<()> for RefCountVisitor<'_> {
+    fn visit_const(&mut self, value: u64, arena: &SymArena) -> () {}
+
+    fn visit_var(&mut self, idx: NodeId, arena: &SymArena) -> () {
+        self.counts.entry(idx).and_modify(|c| *c += 1).or_insert(1);
+    }
+
+    fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> () {
+        arena.accept(left, self);
+        arena.accept(right, self);
+        self.counts.entry(left).and_modify(|c| *c += 1).or_insert(1);
+        self.counts
+            .entry(right)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_sub(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> () {
+        arena.accept(left, self);
+        arena.accept(right, self);
+        self.counts.entry(left).and_modify(|c| *c += 1).or_insert(1);
+        self.counts
+            .entry(right)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_mul(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> () {
+        arena.accept(left, self);
+        arena.accept(right, self);
+        self.counts.entry(left).and_modify(|c| *c += 1).or_insert(1);
+        self.counts
+            .entry(right)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_div(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> () {
+        arena.accept(left, self);
+        arena.accept(right, self);
+        self.counts.entry(left).and_modify(|c| *c += 1).or_insert(1);
+        self.counts
+            .entry(right)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_powi(&mut self, base: NodeId, exp: i32, arena: &SymArena) -> () {
+        arena.accept(base, self);
+        self.counts.entry(base).and_modify(|c| *c += 1).or_insert(1);
+    }
+
+    fn visit_neg(&mut self, operand: NodeId, arena: &SymArena) -> () {
+        arena.accept(operand, self);
+        self.counts
+            .entry(operand)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_sin(&mut self, operand: NodeId, arena: &SymArena) -> () {
+        arena.accept(operand, self);
+        self.counts
+            .entry(operand)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_cos(&mut self, operand: NodeId, arena: &SymArena) -> () {
+        arena.accept(operand, self);
+        self.counts
+            .entry(operand)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_ln(&mut self, operand: NodeId, arena: &SymArena) -> () {
+        arena.accept(operand, self);
+        self.counts
+            .entry(operand)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_exp(&mut self, operand: NodeId, arena: &SymArena) -> () {
+        arena.accept(operand, self);
+        self.counts
+            .entry(operand)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+
+    fn visit_sqrt(&mut self, operand: NodeId, arena: &SymArena) -> () {
+        arena.accept(operand, self);
+        self.counts
+            .entry(operand)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+}
+
+/// A [`SymVisitor`] that emits a `proc_macro2::TokenStream` for an expression
+/// tree, performing simple common sub-expression elimination (CSE).
+///
+/// Nodes whose reference count (from [`RefCountVisitor`]) exceeds 1 are hoisted
+/// into `let tmpN = …;` bindings stored in `instructions`, and subsequent uses
+/// of the same node emit a reference to that temporary rather than recomputing
+/// the expression.
+struct ToTokenStreamVisitor<'a> {
+    arena: &'a SymArena,
+    /// Per-node reference counts used to decide when CSE is worthwhile.
+    counts: &'a HashMap<NodeId, usize>,
+    /// Cache mapping a `NodeId` to the token stream that represents it (either
+    /// the full expression or a reference to the hoisted temporary).
+    cache: HashMap<NodeId, TokenStream>,
+    /// Accumulated `let` bindings for hoisted sub-expressions, in emission order.
+    instructions: Vec<TokenStream>,
+}
+
+impl<'a> ToTokenStreamVisitor<'a> {
+    pub fn new(
+        arena: &'a SymArena,
+        counts: &'a HashMap<NodeId, usize>,
+    ) -> ToTokenStreamVisitor<'a> {
+        ToTokenStreamVisitor {
+            arena,
+            counts,
+            cache: HashMap::new(),
+            instructions: Vec::new(),
+        }
+    }
+
+    /// Given the tokens for `node_id`, either return them directly (if the node
+    /// is only used once) or hoist them into a `let` binding and return a
+    /// reference to the temporary (if the node is used more than once).
+    pub fn write_token(&mut self, node_id: NodeId, tokens: TokenStream) -> TokenStream {
+        // Check if the value is already cached
+        if let Some(token) = self.cache.get(&node_id) {
+            return token.clone();
+        }
+
+        // Check if multiple references to this node exist and if so, store the instruction in a temporary variable and cache resul
+        if *self.counts.get(&node_id).unwrap_or(&0) > 1 {
+            let temp_var = format!("tmp{}", node_id);
+            let temp_token = quote! { let #temp_var = #tokens; };
+            self.instructions.push(temp_token);
+            let temp_token_stream = quote! { #temp_var };
+            self.cache.insert(node_id, temp_token_stream.clone());
+            return temp_token_stream;
+        }
+
+        tokens
+    }
+}
+
+impl SymVisitor<TokenStream> for ToTokenStreamVisitor<'_> {
+    fn visit_const(&mut self, value: u64, arena: &SymArena) -> TokenStream {
+        let f = f64::from_bits(value);
+        quote! { #f }
+    }
+
+    fn visit_var(&mut self, idx: NodeId, arena: &SymArena) -> TokenStream {
+        let var_name = Ident::new("x", proc_macro2::Span::call_site());
+        quote! { #var_name[#idx] }
+    }
+
+    fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
+        let left_tokens = arena.accept(left, self);
+        let right_tokens = arena.accept(right, self);
+        quote! { (#left_tokens + #right_tokens) }
+    }
+
+    fn visit_sub(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
+        let left_tokens = arena.accept(left, self);
+        let right_tokens = arena.accept(right, self);
+        quote! { (#left_tokens - #right_tokens) }
+    }
+
+    fn visit_mul(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
+        let left_tokens = arena.accept(left, self);
+        let right_tokens = arena.accept(right, self);
+        quote! { (#left_tokens * #right_tokens) }
+    }
+
+    fn visit_div(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
+        let left_tokens = arena.accept(left, self);
+        let right_tokens = arena.accept(right, self);
+        quote! { (#left_tokens / #right_tokens) }
+    }
+
+    fn visit_powi(&mut self, base: NodeId, exp: i32, arena: &SymArena) -> TokenStream {
+        let base_tokens = arena.accept(base, self);
+        quote! { (#base_tokens.powi(#exp)) }
+    }
+
+    fn visit_neg(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
+        let operand_tokens = arena.accept(operand, self);
+        quote! { (-#operand_tokens) }
+    }
+
+    fn visit_sin(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
+        let operand_tokens = arena.accept(operand, self);
+        quote! { (#operand_tokens.sin()) }
+    }
+
+    fn visit_cos(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
+        let operand_tokens = arena.accept(operand, self);
+        quote! { (#operand_tokens.cos()) }
+    }
+
+    fn visit_ln(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
+        let operand_tokens = arena.accept(operand, self);
+        quote! { (#operand_tokens.ln()) }
+    }
+
+    fn visit_exp(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
+        let operand_tokens = arena.accept(operand, self);
+        quote! { (#operand_tokens.exp()) }
+    }
+
+    fn visit_sqrt(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
+        let operand_tokens = arena.accept(operand, self);
+        quote! { (#operand_tokens.sqrt()) }
+    }
+}
+
+/// Parse a `syn` expression into the [`SymArena`], returning the root [`NodeId`].
+///
+/// Supported expression forms:
+///
+/// | Source                   | Result                        |
+/// |--------------------------|-------------------------------|
+/// | `1`, `2.0`               | `Const` (f64 bit pattern)     |
+/// | `x[i]`                   | `Var(i)`                      |
+/// | `a + b`, `a - b`         | `Add`, `Sub`                  |
+/// | `a * b`, `a / b`         | `Mul`, `Div`                  |
+/// | `-e`                     | `Neg`                         |
+/// | `e.powi(n)`              | `Powi` (n must be an integer literal) |
+/// | `e.sin()`, `e.cos()`     | `Sin`, `Cos`                  |
+/// | `e.ln()`, `e.exp()`      | `Ln`, `Exp`                   |
+/// | `e.sqrt()`               | `Sqrt`                        |
+/// | `(e)`, `e as T`, `{e}`   | transparent — inner expr used |
+///
+/// # Panics
+///
+/// Panics on any unsupported expression form.
+pub fn parse_syn(arena: &mut SymArena, expr: &Expr) -> NodeId {
     match expr {
-        Expr::Lit(lit) => {
-            if let syn::Lit::Float(f) = &lit.lit {
-                SymExpr::Const(f.base10_parse::<f64>().unwrap())
-            } else if let syn::Lit::Int(i) = &lit.lit {
-                SymExpr::Const(i.base10_parse::<f64>().unwrap())
-            } else {
-                SymExpr::Opaque(quote! { #lit }.to_string())
+        Expr::Lit(lit) => match &lit.lit {
+            syn::Lit::Int(int_lit) => {
+                let value = int_lit.base10_parse::<u64>().unwrap();
+                return arena.intern(SymNode::Const((value as f64).to_bits()));
             }
-        }
+            syn::Lit::Float(flt_lit) => {
+                let value = flt_lit.base10_parse::<f64>().unwrap();
+                return arena.intern(SymNode::Const(value.to_bits()));
+            }
+            _ => panic!("Unsupported literal type"),
+        },
 
-        Expr::Path(path) => {
-            if let Some(ident) = path.path.get_ident() {
-                let name = ident.to_string();
-                if let Some(sym) = bindings.get(&name) {
-                    sym.clone()
+        Expr::Index(index_expr) => {
+            if let Expr::Path(path_expr) = &*index_expr.expr {
+                if path_expr.path.is_ident("x") {
+                    if let Expr::Lit(lit) = &*index_expr.index {
+                        if let syn::Lit::Int(int_lit) = &lit.lit {
+                            let idx = int_lit.base10_parse::<NodeId>().unwrap();
+                            return arena.intern(SymNode::Var(idx));
+                        } else {
+                            panic!("Expected integer literal for variable index");
+                        }
+                    } else {
+                        panic!("Expected literal for variable index");
+                    }
                 } else {
-                    SymExpr::Opaque(quote! { #path }.to_string())
+                    panic!("Expected variable name 'x'");
                 }
             } else {
-                SymExpr::Opaque(quote! { #path }.to_string())
+                panic!("Expected variable access of the form x[i]");
             }
         }
 
-        Expr::Index(index) => SymExpr::Var(
-            index.expr.to_token_stream().to_string(),
-            index
-                .index
-                .to_token_stream()
-                .to_string()
-                .parse::<i32>()
-                .unwrap(),
-        ),
-
-        Expr::Binary(bin) => {
-            let left = syn_to_sym(&bin.left, bindings);
-            let right = syn_to_sym(&bin.right, bindings);
-            match bin.op {
-                syn::BinOp::Add(_) => SymExpr::Add(Box::new(left), Box::new(right)),
-                syn::BinOp::Sub(_) => SymExpr::Sub(Box::new(left), Box::new(right)),
-                syn::BinOp::Mul(_) => SymExpr::Mul(Box::new(left), Box::new(right)),
-                syn::BinOp::Div(_) => SymExpr::Div(Box::new(left), Box::new(right)),
-                _ => SymExpr::Opaque(quote! { #bin }.to_string()),
-            }
+        Expr::Binary(bin_expr) => {
+            let left_id = parse_syn(arena, &bin_expr.left);
+            let right_id = parse_syn(arena, &bin_expr.right);
+            return match bin_expr.op {
+                syn::BinOp::Add(_) => arena.intern(SymNode::Add(left_id, right_id)),
+                syn::BinOp::Sub(_) => arena.intern(SymNode::Sub(left_id, right_id)),
+                syn::BinOp::Mul(_) => arena.intern(SymNode::Mul(left_id, right_id)),
+                syn::BinOp::Div(_) => arena.intern(SymNode::Div(left_id, right_id)),
+                _ => panic!("Unsupported binary operator"),
+            };
         }
 
         Expr::Unary(un) => {
-            let operand = syn_to_sym(&un.expr, bindings);
-            match un.op {
-                syn::UnOp::Neg(_) => SymExpr::Neg(Box::new(operand)),
-                _ => SymExpr::Opaque(quote! { #un }.to_string()),
-            }
+            let operand_id = parse_syn(arena, &un.expr);
+            return match un.op {
+                syn::UnOp::Neg(_) => arena.intern(SymNode::Neg(operand_id)),
+                _ => panic!("Unsupported unary operator"),
+            };
         }
 
-        // Method calls: `x.sin()`, `x.pow(n)`, etc.
         Expr::MethodCall(call) => {
-            let receiver = syn_to_sym(&call.receiver, bindings);
-            let args: Vec<SymExpr> = call
-                .args
-                .iter()
-                .map(|arg| syn_to_sym(arg, bindings))
-                .collect();
-            match call.method.to_string().as_str() {
-                "sin" if args.is_empty() => SymExpr::Sin(Box::new(receiver)),
-                "cos" if args.is_empty() => SymExpr::Cos(Box::new(receiver)),
-                "ln" if args.is_empty() => SymExpr::Ln(Box::new(receiver)),
-                "exp" if args.is_empty() => SymExpr::Exp(Box::new(receiver)),
-                "sqrt" if args.is_empty() => SymExpr::Sqrt(Box::new(receiver)),
-                "powi" if args.len() == 1 => {
-                    if let SymExpr::Const(exp) = &args[0] {
-                        SymExpr::Powi(Box::new(receiver), *exp as i32)
+            let receiver_id = parse_syn(arena, &call.receiver);
+            let method_name = call.method.to_string();
+            return match method_name.as_str() {
+                "powi" => {
+                    if call.args.len() != 1 {
+                        panic!("powi method call must have exactly one argument");
+                    }
+                    if let Expr::Lit(lit) = &call.args[0] {
+                        if let syn::Lit::Int(int_lit) = &lit.lit {
+                            let exp = int_lit.base10_parse::<i32>().unwrap();
+                            arena.intern(SymNode::Powi(receiver_id, exp))
+                        } else {
+                            panic!("Expected integer literal for powi exponent");
+                        }
                     } else {
-                        SymExpr::Opaque(quote! { #call }.to_string())
+                        panic!("Expected literal for powi exponent");
                     }
                 }
-                _ => SymExpr::Opaque(quote! { #call }.to_string()),
-            }
+                "sin" => arena.intern(SymNode::Sin(receiver_id)),
+                "cos" => arena.intern(SymNode::Cos(receiver_id)),
+                "ln" => arena.intern(SymNode::Ln(receiver_id)),
+                "exp" => arena.intern(SymNode::Exp(receiver_id)),
+                "sqrt" => arena.intern(SymNode::Sqrt(receiver_id)),
+                _ => panic!("Unsupported method call: {}", method_name),
+            };
         }
 
-        // Free-function calls: `sin(x)`, `f64::sin(x)`, etc.
-        Expr::Call(call) => {
-            if let Expr::Path(path) = &*call.func {
-                if let Some(ident) = path.path.get_ident() {
-                    let func_name = ident.to_string();
-                    let args: Vec<SymExpr> = call
-                        .args
-                        .iter()
-                        .map(|arg| syn_to_sym(arg, bindings))
-                        .collect();
-                    match func_name.as_str() {
-                        "sin" if args.len() == 1 => return SymExpr::Sin(Box::new(args[0].clone())),
-                        "cos" if args.len() == 1 => return SymExpr::Cos(Box::new(args[0].clone())),
-                        "ln" if args.len() == 1 => return SymExpr::Ln(Box::new(args[0].clone())),
-                        "exp" if args.len() == 1 => return SymExpr::Exp(Box::new(args[0].clone())),
-                        "sqrt" if args.len() == 1 => {
-                            return SymExpr::Sqrt(Box::new(args[0].clone()));
-                        }
-                        "powi" if args.len() == 2 => {
-                            if let SymExpr::Const(exp) = &args[1] {
-                                return SymExpr::Powi(Box::new(args[0].clone()), *exp as i32);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            SymExpr::Opaque(quote! { #call }.to_string())
-        }
+        Expr::Paren(paren) => parse_syn(arena, &paren.expr),
+        Expr::Group(group) => parse_syn(arena, &group.expr),
+        Expr::Cast(c) => parse_syn(arena, &c.expr),
 
-        // Transparent wrappers — recurse into the inner expression.
-        Expr::Paren(paren) => syn_to_sym(&paren.expr, bindings),
-        Expr::Group(group) => syn_to_sym(&group.expr, bindings),
-        // `x as f64` — strip the cast and differentiate the inner expression.
-        Expr::Cast(c) => syn_to_sym(&c.expr, bindings),
-
-        _ => SymExpr::Opaque(quote! { #expr }.to_string()),
+        _ => panic!("Unsupported expression type {:?}", expr),
     }
+}
+
+/// Differentiate `root_id` symbolically with respect to `var_idx`, simplify
+/// the result, and emit it as a `TokenStream`.
+///
+/// The emitted tokens represent a single `f64` expression (no surrounding
+/// function definition).  Common sub-expressions that appear more than once are
+/// hoisted into `let` bindings by [`ToTokenStreamVisitor`].
+pub fn compile_expression(arena: &mut SymArena, root_id: NodeId, var_idx: usize) -> TokenStream {
+    // Differentiate with respect to variable var_idx
+    let diff_transformer = DiffTransformer::new(var_idx);
+    let mut root_id = arena.transform(root_id, &diff_transformer, &mut HashMap::new());
+
+    // Simplify the result
+    let simplify_transformer = SimplifyTransformer::new();
+    root_id = arena.transform(root_id, &simplify_transformer, &mut HashMap::new());
+
+    // Reference counting for common sub-expression elimination
+    let mut ref_count_visitor = RefCountVisitor::new(arena);
+    arena.accept(root_id, &mut ref_count_visitor);
+    let ref_counts = ref_count_visitor.get_counts();
+
+    let mut to_tokens_visitor = ToTokenStreamVisitor::new(arena, &ref_counts);
+    arena.accept(root_id, &mut to_tokens_visitor)
 }

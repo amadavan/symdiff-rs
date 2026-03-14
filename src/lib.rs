@@ -48,10 +48,8 @@
 mod expr;
 
 use expr::*;
-use proc_macro2::TokenStream;
 use quote::quote;
-use std::collections::HashMap;
-use syn::{Pat, Stmt};
+use syn::{Expr, Pat, Stmt};
 
 /// Walk a function body block and return the symbolic form of its return value.
 ///
@@ -62,27 +60,21 @@ use syn::{Pat, Stmt};
 ///
 /// Returns `None` if no bare tail expression is found (e.g. the body ends with
 /// a semicolon-terminated statement or is empty).
-fn parse_body(block: &syn::Block) -> Option<SymExpr> {
-    let mut bindings = HashMap::new();
-
+fn parse_body(block: &syn::Block) -> Option<Expr> {
     for stmt in &block.stmts {
         match stmt {
             Stmt::Local(local) => {
                 if let Pat::Ident(pat_ident) = &local.pat {
-                    let name = pat_ident.ident.to_string();
+                    let _name = pat_ident.ident.to_string();
                     if let Some(init) = &local.init {
-                        let sym = syn_to_sym(&init.expr, &bindings);
-                        bindings.insert(name, sym);
+                        return Some(init.expr.as_ref().clone());
                     }
                 }
             }
-            Stmt::Expr(expr, None) => {
-                return Some(syn_to_sym(expr, &bindings));
-            }
+            Stmt::Expr(expr, None) => return Some(expr.clone()),
             _ => {
                 // Unsupported statement type (e.g. semi-colon terminated expr, item, macro).
-                // For simplicity, we require the function body to be a single expression
-                // with optional `let` bindings, so we can skip these.
+                // For simplicity, we require the function body to be a single expression.
             }
         }
     }
@@ -93,12 +85,8 @@ fn parse_body(block: &syn::Block) -> Option<SymExpr> {
 /// Parsed attribute arguments for [`gradient`].
 #[derive(deluxe::ParseMetaItem)]
 struct DerivativeInput {
-    /// Name of the slice parameter to differentiate with respect to (e.g. `"x"`).
-    arg: String,
     /// Number of gradient components, i.e. the length of the output array.
     dim: usize,
-    /// Maximum number of simplification passes.  `None` uses the default (10).
-    max_passes: Option<usize>,
 }
 
 /// Derive a gradient function for the annotated `fn` at compile time.
@@ -116,37 +104,25 @@ pub fn gradient(
 ) -> proc_macro::TokenStream {
     let input_fn = syn::parse_macro_input!(item as syn::ItemFn);
     let fn_name = &input_fn.sig.ident;
-    let params = &input_fn.sig.inputs;
+    let _params = &input_fn.sig.inputs;
     let body = &input_fn.block;
     let vis = &input_fn.vis;
 
-    let DerivativeInput {
-        arg,
-        dim,
-        max_passes,
-    } = deluxe::parse::<DerivativeInput>(attr.into())
+    let DerivativeInput { dim } = deluxe::parse::<DerivativeInput>(attr.into())
         .expect("Failed to parse macro attribute arguments for gradient.");
 
-    let sym = match parse_body(body) {
-        Some(s) => s,
-        None => {
-            return syn::Error::new_spanned(
-                body,
-                "Function body must be a single expression for symbolic differentiation",
-            )
-            .to_compile_error()
-            .into();
-        }
-    };
+    let func_def = parse_body(body);
+    let mut arena = SymArena::new();
 
-    let grad_components: Vec<TokenStream> = (0..dim)
-        .map(|i| {
-            let d = sym
-                .diff(format!("{}[{}]", arg, i))
-                .simplify_multipass(max_passes);
-            d.into_token_stream()
-        })
-        .collect();
+    if func_def.is_none() {
+        panic!("Function body must end with a bare expression (no trailing semicolon).");
+    }
+
+    let root = parse_syn(&mut arena, &func_def.unwrap());
+
+    let gradient_tokens = (0..dim)
+        .map(|i| compile_expression(&mut arena, root, i))
+        .collect::<Vec<_>>();
 
     let grad_name = syn::Ident::new(
         &format!("{}_gradient", fn_name),
@@ -156,8 +132,8 @@ pub fn gradient(
     let expanded = quote!(
         #input_fn
 
-        #vis fn #grad_name(#params) -> [f64; #dim] {
-            [#(#grad_components),*]
+        #vis fn #grad_name(x: &[f64]) -> [f64; #dim] {
+            [#(#gradient_tokens),*]
         }
     );
 

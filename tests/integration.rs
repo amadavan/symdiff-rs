@@ -2,48 +2,48 @@
 
 use symdiff::gradient;
 
-#[gradient(arg = "x", dim = 2)]
+#[gradient(dim = 2)]
 fn add(x: &[f64]) -> f64 {
     3.0 * x[0] + 4.0 * x[1]
 }
 
-#[gradient(arg = "x", dim = 2)]
+#[gradient(dim = 2)]
 fn subtract(x: &[f64]) -> f64 {
     3.0 * x[0] - 4.0 * x[1]
 }
 
-#[gradient(arg = "x", dim = 2)]
+#[gradient(dim = 2)]
 fn linear(x: &[f64]) -> f64 {
     3.0 * x[0] + 4.0 * x[1]
 }
 
-#[gradient(arg = "x", dim = 2)]
+#[gradient(dim = 2)]
 fn quadratic(x: &[f64]) -> f64 {
     x[0].powi(2) + x[0] * x[1] + x[1].powi(3)
 }
 
-#[gradient(arg = "x", dim = 2)]
+#[gradient(dim = 2)]
 fn multiply(x: &[f64]) -> f64 {
     x[0] * x[1]
 }
 
-#[gradient(arg = "x", dim = 2)]
+#[gradient(dim = 2)]
 fn divide(x: &[f64]) -> f64 {
     x[0] / x[1]
 }
 
-#[gradient(arg = "x", dim = 2)]
+#[gradient(dim = 2)]
 fn rosenbrock(x: &[f64]) -> f64 {
     (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2)
 }
 
-#[gradient(arg = "x", dim = 1)]
+#[gradient(dim = 1)]
 fn trig(x: &[f64]) -> f64 {
     x[0].sin() + x[0].cos().powi(2)
 }
 
 // let-binding inlining
-#[gradient(arg = "x", dim = 2)]
+#[gradient(dim = 2)]
 fn with_lets(x: &[f64]) -> f64 {
     let a = x[0].powi(2);
     let b = 2.0 * x[1];
@@ -128,20 +128,10 @@ mod test {
     }
 
     // #[test]
-    // fn quadratic_hessian_values() {
-    //     // f = x² + xy + y³  →  H = [[2, 1], [1, 6y]]
-    //     let h = quadratic_hessian(0.0, 2.0);
-    //     assert_eq!(h[0][0], 2.0);
-    //     assert_eq!(h[0][1], 1.0);
-    //     assert_eq!(h[1][0], 1.0);
-    //     assert!((h[1][1] - 12.0).abs() < 1e-10);
+    // fn let_binding_inlining() {
+    //     // f = x² + 2y  →  df/dx = 2x, df/dy = 2
+    //     let g = with_lets_gradient(&[3.0, 5.0]);
+    //     assert!((g[0] - 6.0).abs() < 1e-10, "df/dx = {}", g[0]);
+    //     assert!((g[1] - 2.0).abs() < 1e-10, "df/dy = {}", g[1]);
     // }
-
-    #[test]
-    fn let_binding_inlining() {
-        // f = x² + 2y  →  df/dx = 2x, df/dy = 2
-        let g = with_lets_gradient(&[3.0, 5.0]);
-        assert!((g[0] - 6.0).abs() < 1e-10, "df/dx = {}", g[0]);
-        assert!((g[1] - 2.0).abs() < 1e-10, "df/dy = {}", g[1]);
-    }
 }

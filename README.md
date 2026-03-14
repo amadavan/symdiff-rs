@@ -166,4 +166,4 @@ emitting native Rust code at compile time.
 
 ---
 
-> *AI Disclosure* — portions of this crate were developed with AI tooling assistance.
+> *AI Disclosure* — the structure of the library was inspired by AI-tooling, and documentation has been largely AI-generated.
