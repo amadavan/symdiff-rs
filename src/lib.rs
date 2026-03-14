@@ -41,11 +41,181 @@
 //! | `e.powi(n)` (integer literal `n`)       | `Powi`              |
 //! | `(e)`, `e as f64`                       | transparent         |
 //! | anything else                           | compile-time panic  |
-mod expr;
+mod arena;
+mod transformers;
+mod visitors;
 
-use expr::*;
+use std::collections::HashMap;
+
+use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Expr, Pat, Stmt};
+
+use arena::{NodeId, SymArena, SymNode};
+use transformers::{DiffTransformer, SimplifyTransformer};
+use visitors::{RefCountVisitor, ToTokenStreamVisitor};
+
+/// Parse a `syn` expression into the [`SymArena`], returning the root [`NodeId`].
+///
+/// Supported expression forms:
+///
+/// | Source                   | Result                        |
+/// |--------------------------|-------------------------------|
+/// | `1`, `2.0`               | `Const` (f64 bit pattern)     |
+/// | `x[i]`                   | `Var(i)`                      |
+/// | `a + b`, `a - b`         | `Add`, `Sub`                  |
+/// | `a * b`, `a / b`         | `Mul`, `Div`                  |
+/// | `-e`                     | `Neg`                         |
+/// | `e.powi(n)`              | `Powi` (n must be an integer literal) |
+/// | `e.sin()`, `e.cos()`     | `Sin`, `Cos`                  |
+/// | `e.ln()`, `e.exp()`      | `Ln`, `Exp`                   |
+/// | `e.sqrt()`               | `Sqrt`                        |
+/// | `(e)`, `e as T`, `{e}`   | transparent — inner expr used |
+///
+/// # Panics
+///
+/// Panics on any unsupported expression form.
+fn parse_syn(arena: &mut SymArena, expr: &Expr) -> NodeId {
+    match expr {
+        Expr::Lit(lit) => match &lit.lit {
+            syn::Lit::Int(int_lit) => {
+                let value = int_lit.base10_parse::<u64>().unwrap();
+                return arena.intern(SymNode::Const((value as f64).to_bits()));
+            }
+            syn::Lit::Float(flt_lit) => {
+                let value = flt_lit.base10_parse::<f64>().unwrap();
+                return arena.intern(SymNode::Const(value.to_bits()));
+            }
+            _ => panic!("Unsupported literal type"),
+        },
+
+        Expr::Index(index_expr) => {
+            if let Expr::Path(path_expr) = &*index_expr.expr {
+                if path_expr.path.is_ident("x") {
+                    if let Expr::Lit(lit) = &*index_expr.index {
+                        if let syn::Lit::Int(int_lit) = &lit.lit {
+                            let idx = int_lit.base10_parse::<NodeId>().unwrap();
+                            return arena.intern(SymNode::Var(idx));
+                        } else {
+                            panic!("Expected integer literal for variable index");
+                        }
+                    } else {
+                        panic!("Expected literal for variable index");
+                    }
+                } else {
+                    panic!("Expected variable name 'x'");
+                }
+            } else {
+                panic!("Expected variable access of the form x[i]");
+            }
+        }
+
+        Expr::Binary(bin_expr) => {
+            let left_id = parse_syn(arena, &bin_expr.left);
+            let right_id = parse_syn(arena, &bin_expr.right);
+            return match bin_expr.op {
+                syn::BinOp::Add(_) => arena.intern(SymNode::Add(left_id, right_id)),
+                syn::BinOp::Sub(_) => arena.intern(SymNode::Sub(left_id, right_id)),
+                syn::BinOp::Mul(_) => arena.intern(SymNode::Mul(left_id, right_id)),
+                syn::BinOp::Div(_) => arena.intern(SymNode::Div(left_id, right_id)),
+                _ => panic!("Unsupported binary operator"),
+            };
+        }
+
+        Expr::Unary(un) => {
+            let operand_id = parse_syn(arena, &un.expr);
+            return match un.op {
+                syn::UnOp::Neg(_) => arena.intern(SymNode::Neg(operand_id)),
+                _ => panic!("Unsupported unary operator"),
+            };
+        }
+
+        Expr::MethodCall(call) => {
+            let receiver_id = parse_syn(arena, &call.receiver);
+            let method_name = call.method.to_string();
+            return match method_name.as_str() {
+                "powi" => {
+                    if call.args.len() != 1 {
+                        panic!("powi method call must have exactly one argument");
+                    }
+                    if let Expr::Lit(lit) = &call.args[0] {
+                        if let syn::Lit::Int(int_lit) = &lit.lit {
+                            let exp = int_lit.base10_parse::<i32>().unwrap();
+                            arena.intern(SymNode::Powi(receiver_id, exp))
+                        } else {
+                            panic!("Expected integer literal for powi exponent");
+                        }
+                    } else {
+                        panic!("Expected literal for powi exponent");
+                    }
+                }
+                "sin" => arena.intern(SymNode::Sin(receiver_id)),
+                "cos" => arena.intern(SymNode::Cos(receiver_id)),
+                "ln" => arena.intern(SymNode::Ln(receiver_id)),
+                "exp" => arena.intern(SymNode::Exp(receiver_id)),
+                "sqrt" => arena.intern(SymNode::Sqrt(receiver_id)),
+                _ => panic!("Unsupported method call: {}", method_name),
+            };
+        }
+
+        Expr::Paren(paren) => parse_syn(arena, &paren.expr),
+        Expr::Group(group) => parse_syn(arena, &group.expr),
+        Expr::Cast(c) => parse_syn(arena, &c.expr),
+
+        _ => panic!("Unsupported expression type {:?}", expr),
+    }
+}
+
+/// Differentiate `root_id` symbolically with respect to `var_idx`, simplify
+/// the result, and emit it as a `TokenStream`.
+///
+/// The emitted tokens represent a single `f64` expression (no surrounding
+/// function definition).  Common sub-expressions that appear more than once are
+/// hoisted into `let` bindings by [`ToTokenStreamVisitor`].
+fn compile_expression(
+    arena: &mut SymArena,
+    root_id: NodeId,
+    var_idx: usize,
+    max_passes: usize,
+) -> TokenStream {
+    let cost_estimates = HashMap::from([
+        (SymNode::Const(0), 0),
+        (SymNode::Var(0), 0),
+        (SymNode::Add(0, 0), 1),
+        (SymNode::Sub(0, 0), 1),
+        (SymNode::Mul(0, 0), 1),
+        (SymNode::Div(0, 0), 15),
+        (SymNode::Powi(0, 0), 3),
+        (SymNode::Neg(0), 0),
+        (SymNode::Sin(0), 100),
+        (SymNode::Cos(0), 100),
+        (SymNode::Ln(0), 60),
+        (SymNode::Exp(0), 60),
+        (SymNode::Sqrt(0), 5),
+    ]);
+
+    // Differentiate with respect to variable var_idx
+    let diff_transformer = DiffTransformer::new(var_idx);
+    let mut root_id = arena.transform(root_id, &diff_transformer, &mut HashMap::new());
+
+    // Simplify the result
+    let simplify_transformer = SimplifyTransformer::new();
+    for _ in 0..max_passes {
+        let new_root_id = arena.transform(root_id, &simplify_transformer, &mut HashMap::new());
+        if new_root_id == root_id {
+            break; // No further simplification possible
+        }
+        root_id = new_root_id;
+    }
+
+    // Reference counting for common sub-expression elimination
+    let mut ref_count_visitor = RefCountVisitor::new();
+    arena.accept(root_id, &mut ref_count_visitor);
+    let ref_counts = ref_count_visitor.get_counts();
+
+    let mut to_tokens_visitor = ToTokenStreamVisitor::new(&ref_counts);
+    arena.accept(root_id, &mut to_tokens_visitor)
+}
 
 /// Walk a function body block and return the symbolic form of its return value.
 ///
