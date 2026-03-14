@@ -12,7 +12,7 @@
 //! ```rust,ignore
 //! use symdiff::gradient;
 //!
-//! #[gradient(arg = "x", dim = 2)]
+//! #[gradient(dim = 2)]
 //! fn rosenbrock(x: &[f64]) -> f64 {
 //!     (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2)
 //! }
@@ -23,28 +23,24 @@
 //!
 //! ## Attribute parameters
 //!
-//! | Parameter | Type | Description |
-//! |---|---|---|
-//! | `arg` | `&str` | Name of the slice parameter to differentiate with respect to |
-//! | `dim` | `usize` | Number of components (length of the gradient vector) |
-//! | `max_passes` | `usize` (optional) | Maximum simplification passes; defaults to 10 |
+//! | Parameter    | Type    | Description                                      |
+//! |--------------|---------|--------------------------------------------------|
+//! | `dim`        | `usize` | Number of components (length of the gradient)    |
+//! | `max_passes` | `usize` | Max simplification passes; optional, default 10  |
 //!
 //! # Supported syntax
 //!
-//! | Source form | Symbolic node |
-//! |---|---|
-//! | `x[i]` | `Var` — the `i`-th component of `arg` |
-//! | `1.0`, `2` | `Const` |
-//! | `e + f`, `e - f`, `e * f`, `e / f` | `Add`, `Sub`, `Mul`, `Div` |
-//! | `-e` | `Neg` |
-//! | `e.sin()`, `e.cos()` | `Sin`, `Cos` |
-//! | `e.ln()`, `e.exp()`, `e.sqrt()` | `Ln`, `Exp`, `Sqrt` |
-//! | `e.powi(n)` (const `n`) | `Powi` |
-//! | `let name = expr;` | inlined into subsequent expressions |
-//! | `(e)`, `e as f64` | transparent — inner expression used |
-//! | anything else | `Opaque` — derivative assumed zero |
-//!
-//! > *AI Disclosure* The structure and partial implementation of this file was generated with AI-tooling.
+//! | Source form                             | Symbolic node       |
+//! |-----------------------------------------|---------------------|
+//! | `x[i]`                                  | `Var`               |
+//! | `1.0`, `2`                              | `Const`             |
+//! | `e + f`, `e - f`, `e * f`, `e / f`     | `Add/Sub/Mul/Div`   |
+//! | `-e`                                    | `Neg`               |
+//! | `e.sin()`, `e.cos()`                    | `Sin`, `Cos`        |
+//! | `e.ln()`, `e.exp()`, `e.sqrt()`         | `Ln`, `Exp`, `Sqrt` |
+//! | `e.powi(n)` (integer literal `n`)       | `Powi`              |
+//! | `(e)`, `e as f64`                       | transparent         |
+//! | anything else                           | compile-time panic  |
 mod expr;
 
 use expr::*;
@@ -87,6 +83,8 @@ fn parse_body(block: &syn::Block) -> Option<Expr> {
 struct DerivativeInput {
     /// Number of gradient components, i.e. the length of the output array.
     dim: usize,
+    /// Maximum number of simplification passes to perform; defaults to 10 if not specified.
+    max_passes: Option<usize>,
 }
 
 /// Derive a gradient function for the annotated `fn` at compile time.
@@ -108,7 +106,7 @@ pub fn gradient(
     let body = &input_fn.block;
     let vis = &input_fn.vis;
 
-    let DerivativeInput { dim } = deluxe::parse::<DerivativeInput>(attr.into())
+    let DerivativeInput { dim, max_passes } = deluxe::parse::<DerivativeInput>(attr.into())
         .expect("Failed to parse macro attribute arguments for gradient.");
 
     let func_def = parse_body(body);
@@ -121,7 +119,7 @@ pub fn gradient(
     let root = parse_syn(&mut arena, &func_def.unwrap());
 
     let gradient_tokens = (0..dim)
-        .map(|i| compile_expression(&mut arena, root, i))
+        .map(|i| compile_expression(&mut arena, root, i, max_passes.unwrap_or(10)))
         .collect::<Vec<_>>();
 
     let grad_name = syn::Ident::new(

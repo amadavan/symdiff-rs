@@ -1305,14 +1305,25 @@ pub fn parse_syn(arena: &mut SymArena, expr: &Expr) -> NodeId {
 /// The emitted tokens represent a single `f64` expression (no surrounding
 /// function definition).  Common sub-expressions that appear more than once are
 /// hoisted into `let` bindings by [`ToTokenStreamVisitor`].
-pub fn compile_expression(arena: &mut SymArena, root_id: NodeId, var_idx: usize) -> TokenStream {
+pub fn compile_expression(
+    arena: &mut SymArena,
+    root_id: NodeId,
+    var_idx: usize,
+    max_passes: usize,
+) -> TokenStream {
     // Differentiate with respect to variable var_idx
     let diff_transformer = DiffTransformer::new(var_idx);
     let mut root_id = arena.transform(root_id, &diff_transformer, &mut HashMap::new());
 
     // Simplify the result
     let simplify_transformer = SimplifyTransformer::new();
-    root_id = arena.transform(root_id, &simplify_transformer, &mut HashMap::new());
+    for _ in 0..max_passes {
+        let new_root_id = arena.transform(root_id, &simplify_transformer, &mut HashMap::new());
+        if new_root_id == root_id {
+            break; // No further simplification possible
+        }
+        root_id = new_root_id;
+    }
 
     // Reference counting for common sub-expression elimination
     let mut ref_count_visitor = RefCountVisitor::new(arena);
