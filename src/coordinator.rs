@@ -34,25 +34,28 @@ impl<'a> Coordinator for GreedyCoordinator<'a> {
         for old_id in order {
             let mut trial_arena = arena.clone();
             let mut candidates = vec![(root, &mut trial_arena)];
+            candidates.reserve(5);
 
             // Consider commutation
             let mut comm_arena = arena.clone();
             let comm_root = comm_arena.transform_single_node(old_id, &commutative_transformer);
+            let comm_arena_cloned = comm_arena.clone();
             candidates.push((comm_root, &mut comm_arena));
 
             // Consider association
             let mut assoc_arena = arena.clone();
             let assoc_root = assoc_arena.transform_single_node(old_id, &associative_transformer);
+            let assoc_arena_cloned = assoc_arena.clone();
             candidates.push((assoc_root, &mut assoc_arena));
 
             // Consider commutation of the association
-            let mut comm_assoc_arena = arena.clone();
+            let mut comm_assoc_arena = assoc_arena_cloned;
             let comm_assoc_root =
                 comm_assoc_arena.transform_single_node(assoc_root, &commutative_transformer);
             candidates.push((comm_assoc_root, &mut comm_assoc_arena));
 
             // Consider association of the commutation
-            let mut assoc_comm_arena = arena.clone();
+            let mut assoc_comm_arena = comm_arena_cloned;
             let assoc_comm_root =
                 assoc_comm_arena.transform_single_node(comm_root, &associative_transformer);
             candidates.push((assoc_comm_root, &mut assoc_comm_arena));
@@ -65,16 +68,15 @@ impl<'a> Coordinator for GreedyCoordinator<'a> {
                 .min_by_key(|(candidate, arena)| arena.accept(*candidate, &mut cost_visitor))
                 .unwrap();
 
-            // Add corresponding trial arena to arena
+            // Set arena to the corresponding arena of the top candidate
             *arena = top_candidate.1.clone();
 
             remapping.insert(old_id, top_candidate.0);
-            let remap_transformer = RemapTransformer::new(&remapping);
 
             // Transform the lower ids to the new ids
-            arena.transform(old_id, &remap_transformer);
+            arena.transform(old_id, &RemapTransformer::new(&remapping));
         }
 
-        root
+        arena.transform(root, &RemapTransformer::new(&remapping))
     }
 }

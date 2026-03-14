@@ -56,6 +56,8 @@ use arena::{NodeId, SymArena, SymNode};
 use transformers::{DiffTransformer, SimplifyTransformer};
 use visitors::{RefCountVisitor, ToTokenStreamVisitor};
 
+use crate::coordinator::{Coordinator, GreedyCoordinator};
+
 /// Parse a `syn` expression into the [`SymArena`], returning the root [`NodeId`].
 ///
 /// Supported expression forms:
@@ -210,6 +212,8 @@ fn compile_expression(
     }
 
     // Commutative and associative reordering to canonicalize expressions and expose more common sub-expressions.
+    let greedy_coordinator = GreedyCoordinator::new(&cost_estimates);
+    root_id = greedy_coordinator.optimize(root_id, arena);
 
     // Reference counting for common sub-expression elimination
     let mut ref_count_visitor = RefCountVisitor::new();
