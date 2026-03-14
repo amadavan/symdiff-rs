@@ -7,17 +7,16 @@ use syn::Ident;
 use crate::arena::{NodeId, SymArena, SymNode, SymVisitor};
 
 pub struct CostEstimateVisitor<'a> {
-    arena: &'a SymArena,
-    costs: HashMap<SymNode, usize>,
+    costs: &'a HashMap<SymNode, usize>,
 }
 
-impl CostEstimateVisitor<'_> {
-    pub fn new(arena: &'_ SymArena, costs: HashMap<SymNode, usize>) -> CostEstimateVisitor<'_> {
-        CostEstimateVisitor { arena, costs }
+impl<'a> CostEstimateVisitor<'a> {
+    pub fn new(costs: &'a HashMap<SymNode, usize>) -> CostEstimateVisitor<'a> {
+        CostEstimateVisitor { costs }
     }
 }
 
-impl SymVisitor<usize> for CostEstimateVisitor<'_> {
+impl<'a> SymVisitor<usize> for CostEstimateVisitor<'a> {
     fn visit_const(&mut self, _value: u64, _arena: &SymArena) -> usize {
         *self.costs.get(&SymNode::Const(0)).unwrap_or(&0)
     }

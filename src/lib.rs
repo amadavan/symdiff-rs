@@ -42,6 +42,7 @@
 //! | `(e)`, `e as f64`                       | transparent         |
 //! | anything else                           | compile-time panic  |
 mod arena;
+mod coordinator;
 mod transformers;
 mod visitors;
 
@@ -196,17 +197,19 @@ fn compile_expression(
 
     // Differentiate with respect to variable var_idx
     let diff_transformer = DiffTransformer::new(var_idx);
-    let mut root_id = arena.transform(root_id, &diff_transformer, &mut HashMap::new());
+    let mut root_id = arena.transform(root_id, &diff_transformer);
 
     // Simplify the result
     let simplify_transformer = SimplifyTransformer::new();
     for _ in 0..max_passes {
-        let new_root_id = arena.transform(root_id, &simplify_transformer, &mut HashMap::new());
+        let new_root_id = arena.transform(root_id, &simplify_transformer);
         if new_root_id == root_id {
             break; // No further simplification possible
         }
         root_id = new_root_id;
     }
+
+    // Commutative and associative reordering to canonicalize expressions and expose more common sub-expressions.
 
     // Reference counting for common sub-expression elimination
     let mut ref_count_visitor = RefCountVisitor::new();

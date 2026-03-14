@@ -41,6 +41,7 @@ pub enum SymNode {
 /// Nodes are stored in a flat `Vec` and looked up by index ([`NodeId`]).
 /// [`SymArena::intern`] guarantees that each structurally distinct node is
 /// stored at most once, so two equal nodes always get the same `NodeId`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymArena {
     nodes: Vec<SymNode>,
     lookup: HashMap<SymNode, NodeId>,
@@ -102,23 +103,32 @@ impl SymArena {
         &mut self,
         node_id: NodeId,
         transformer: &T,
-        diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
         let node = self.nodes[node_id];
         match node {
-            SymNode::Const(value) => transformer.process_const(value, self, diff),
-            SymNode::Var(idx) => transformer.process_var(idx, self, diff),
-            SymNode::Add(left, right) => transformer.process_add(left, right, self, diff),
-            SymNode::Sub(left, right) => transformer.process_sub(left, right, self, diff),
-            SymNode::Mul(left, right) => transformer.process_mul(left, right, self, diff),
-            SymNode::Div(left, right) => transformer.process_div(left, right, self, diff),
-            SymNode::Powi(base, exp) => transformer.process_powi(base, exp, self, diff),
-            SymNode::Neg(operand) => transformer.process_neg(operand, self, diff),
-            SymNode::Sin(operand) => transformer.process_sin(operand, self, diff),
-            SymNode::Cos(operand) => transformer.process_cos(operand, self, diff),
-            SymNode::Ln(operand) => transformer.process_ln(operand, self, diff),
-            SymNode::Exp(operand) => transformer.process_exp(operand, self, diff),
-            SymNode::Sqrt(operand) => transformer.process_sqrt(operand, self, diff),
+            SymNode::Const(value) => transformer.process_const(value, self, &mut HashMap::new()),
+            SymNode::Var(idx) => transformer.process_var(idx, self, &mut HashMap::new()),
+            SymNode::Add(left, right) => {
+                transformer.process_add(left, right, self, &mut HashMap::new())
+            }
+            SymNode::Sub(left, right) => {
+                transformer.process_sub(left, right, self, &mut HashMap::new())
+            }
+            SymNode::Mul(left, right) => {
+                transformer.process_mul(left, right, self, &mut HashMap::new())
+            }
+            SymNode::Div(left, right) => {
+                transformer.process_div(left, right, self, &mut HashMap::new())
+            }
+            SymNode::Powi(base, exp) => {
+                transformer.process_powi(base, exp, self, &mut HashMap::new())
+            }
+            SymNode::Neg(operand) => transformer.process_neg(operand, self, &mut HashMap::new()),
+            SymNode::Sin(operand) => transformer.process_sin(operand, self, &mut HashMap::new()),
+            SymNode::Cos(operand) => transformer.process_cos(operand, self, &mut HashMap::new()),
+            SymNode::Ln(operand) => transformer.process_ln(operand, self, &mut HashMap::new()),
+            SymNode::Exp(operand) => transformer.process_exp(operand, self, &mut HashMap::new()),
+            SymNode::Sqrt(operand) => transformer.process_sqrt(operand, self, &mut HashMap::new()),
         }
     }
 
@@ -128,12 +138,7 @@ impl SymArena {
     /// `diff` is an *output* parameter populated by the caller (pass an empty
     /// `HashMap`).  On return it maps each original `NodeId` to the transformed
     /// `NodeId` produced by the transformer.
-    pub fn transform<T: SymTransformer>(
-        &mut self,
-        root: NodeId,
-        transformer: &T,
-        diff: &mut HashMap<NodeId, NodeId>,
-    ) -> NodeId {
+    pub fn transform<T: SymTransformer>(&mut self, root: NodeId, transformer: &T) -> NodeId {
         let order = self.get_topological_order(root);
 
         let mut diff_map = HashMap::new();

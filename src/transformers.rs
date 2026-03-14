@@ -601,11 +601,17 @@ impl SymTransformer for SimplifyTransformer {
     }
 }
 
-struct CommutativeTransformer {
+pub struct CommutativeTransformer {
     // This transformer will reorder the operands of commutative operations
     // (like addition and multiplication) in a canonical way to enable better
     // common sub-expression elimination.  For example, it might sort the
     // operands by their node ids or by some hash of their structure.
+}
+
+impl CommutativeTransformer {
+    pub fn new() -> CommutativeTransformer {
+        CommutativeTransformer {}
+    }
 }
 
 impl SymTransformer for CommutativeTransformer {
@@ -799,7 +805,7 @@ impl SymTransformer for CommutativeTransformer {
     }
 }
 
-struct AssociativeTransformer {
+pub struct AssociativeTransformer {
     // This transformer will reorder the operands of associative operations
     // (like addition and multiplication) into a right-associative form to
     // enable better common sub-expression elimination.  For example, it might
@@ -1053,5 +1059,160 @@ impl SymTransformer for AssociativeTransformer {
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
         arena.intern(SymNode::Sqrt(operand))
+    }
+}
+
+pub struct RemapTransformer<'a> {
+    // This transformer will remap variable indices according to a provided mapping.
+    // For example, it might be used to rename variables or to substitute one variable for another.
+    mapping: &'a HashMap<NodeId, NodeId>,
+}
+
+impl<'a> RemapTransformer<'a> {
+    pub fn new(mapping: &'a HashMap<NodeId, NodeId>) -> RemapTransformer<'a> {
+        RemapTransformer { mapping }
+    }
+}
+
+impl<'a> SymTransformer for RemapTransformer<'a> {
+    fn process_const(
+        &self,
+        value: u64,
+        arena: &mut SymArena,
+        _diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        arena.intern(SymNode::Const(value))
+    }
+
+    fn process_var(
+        &self,
+        idx: NodeId,
+        arena: &mut SymArena,
+        _diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        if let Some(&new_idx) = self.mapping.get(&idx) {
+            arena.intern(SymNode::Var(new_idx))
+        } else {
+            arena.intern(SymNode::Var(idx))
+        }
+    }
+
+    fn process_add(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_id = *self.mapping.get(&left).unwrap_or(&diff[&left]);
+        let right_id = *self.mapping.get(&right).unwrap_or(&diff[&right]);
+        arena.intern(SymNode::Add(left_id, right_id))
+    }
+
+    fn process_sub(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_id = *self.mapping.get(&left).unwrap_or(&diff[&left]);
+        let right_id = *self.mapping.get(&right).unwrap_or(&diff[&right]);
+        arena.intern(SymNode::Sub(left_id, right_id))
+    }
+
+    fn process_mul(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_id = *self.mapping.get(&left).unwrap_or(&diff[&left]);
+        let right_id = *self.mapping.get(&right).unwrap_or(&diff[&right]);
+        arena.intern(SymNode::Mul(left_id, right_id))
+    }
+
+    fn process_div(
+        &self,
+        left: NodeId,
+        right: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let left_id = *self.mapping.get(&left).unwrap_or(&diff[&left]);
+        let right_id = *self.mapping.get(&right).unwrap_or(&diff[&right]);
+        arena.intern(SymNode::Div(left_id, right_id))
+    }
+
+    fn process_powi(
+        &self,
+        base: NodeId,
+        exp: i32,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let base_id = *self.mapping.get(&base).unwrap_or(&diff[&base]);
+        arena.intern(SymNode::Powi(base_id, exp))
+    }
+
+    fn process_neg(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = *self.mapping.get(&operand).unwrap_or(&diff[&operand]);
+        arena.intern(SymNode::Neg(operand_id))
+    }
+
+    fn process_sin(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = *self.mapping.get(&operand).unwrap_or(&diff[&operand]);
+        arena.intern(SymNode::Sin(operand_id))
+    }
+
+    fn process_cos(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = *self.mapping.get(&operand).unwrap_or(&diff[&operand]);
+        arena.intern(SymNode::Cos(operand_id))
+    }
+
+    fn process_ln(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = *self.mapping.get(&operand).unwrap_or(&diff[&operand]);
+        arena.intern(SymNode::Ln(operand_id))
+    }
+
+    fn process_exp(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = *self.mapping.get(&operand).unwrap_or(&diff[&operand]);
+        arena.intern(SymNode::Exp(operand_id))
+    }
+
+    fn process_sqrt(
+        &self,
+        operand: NodeId,
+        arena: &mut SymArena,
+        diff: &mut HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        let operand_id = *self.mapping.get(&operand).unwrap_or(&diff[&operand]);
+        arena.intern(SymNode::Sqrt(operand_id))
     }
 }
