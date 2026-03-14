@@ -937,6 +937,86 @@ impl SymTransformer for SimplifyTransformer {
     }
 }
 
+struct CostEstimateVisitor<'a> {
+    arena: &'a SymArena,
+    costs: HashMap<SymNode, usize>,
+}
+
+impl CostEstimateVisitor<'_> {
+    pub fn new(arena: &'_ SymArena, costs: HashMap<SymNode, usize>) -> CostEstimateVisitor<'_> {
+        CostEstimateVisitor { arena, costs }
+    }
+}
+
+impl SymVisitor<usize> for CostEstimateVisitor<'_> {
+    fn visit_const(&mut self, value: u64, arena: &SymArena) -> usize {
+        *self.costs.get(&SymNode::Const(0)).unwrap_or(&0)
+    }
+
+    fn visit_var(&mut self, idx: NodeId, arena: &SymArena) -> usize {
+        *self.costs.get(&SymNode::Var(0)).unwrap_or(&0)
+    }
+
+    fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> usize {
+        let left_cost = arena.accept(left, self);
+        let right_cost = arena.accept(right, self);
+        *self.costs.get(&SymNode::Add(0, 0)).unwrap_or(&1) + left_cost + right_cost
+    }
+
+    fn visit_sub(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> usize {
+        let left_cost = arena.accept(left, self);
+        let right_cost = arena.accept(right, self);
+        *self.costs.get(&SymNode::Sub(0, 0)).unwrap_or(&1) + left_cost + right_cost
+    }
+
+    fn visit_mul(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> usize {
+        let left_cost = arena.accept(left, self);
+        let right_cost = arena.accept(right, self);
+        *self.costs.get(&SymNode::Mul(0, 0)).unwrap_or(&2) + left_cost + right_cost
+    }
+
+    fn visit_div(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> usize {
+        let left_cost = arena.accept(left, self);
+        let right_cost = arena.accept(right, self);
+        *self.costs.get(&SymNode::Div(0, 0)).unwrap_or(&3) + left_cost + right_cost
+    }
+
+    fn visit_powi(&mut self, base: NodeId, exp: i32, arena: &SymArena) -> usize {
+        let base_cost = arena.accept(base, self);
+        *self.costs.get(&SymNode::Powi(0, 0)).unwrap_or(&3) + base_cost
+    }
+
+    fn visit_neg(&mut self, operand: NodeId, arena: &SymArena) -> usize {
+        let operand_cost = arena.accept(operand, self);
+        *self.costs.get(&SymNode::Neg(0)).unwrap_or(&1) + operand_cost
+    }
+
+    fn visit_sin(&mut self, operand: NodeId, arena: &SymArena) -> usize {
+        let operand_cost = arena.accept(operand, self);
+        *self.costs.get(&SymNode::Sin(0)).unwrap_or(&4) + operand_cost
+    }
+
+    fn visit_cos(&mut self, operand: NodeId, arena: &SymArena) -> usize {
+        let operand_cost = arena.accept(operand, self);
+        *self.costs.get(&SymNode::Cos(0)).unwrap_or(&4) + operand_cost
+    }
+
+    fn visit_ln(&mut self, operand: NodeId, arena: &SymArena) -> usize {
+        let operand_cost = arena.accept(operand, self);
+        *self.costs.get(&SymNode::Ln(0)).unwrap_or(&4) + operand_cost
+    }
+
+    fn visit_exp(&mut self, operand: NodeId, arena: &SymArena) -> usize {
+        let operand_cost = arena.accept(operand, self);
+        *self.costs.get(&SymNode::Exp(0)).unwrap_or(&4) + operand_cost
+    }
+
+    fn visit_sqrt(&mut self, operand: NodeId, arena: &SymArena) -> usize {
+        let operand_cost = arena.accept(operand, self);
+        *self.costs.get(&SymNode::Sqrt(0)).unwrap_or(&4) + operand_cost
+    }
+}
+
 /// A [`SymVisitor`] that counts how many times each [`NodeId`] is referenced
 /// in the sub-tree rooted at the visited node.
 ///
@@ -1311,6 +1391,22 @@ pub fn compile_expression(
     var_idx: usize,
     max_passes: usize,
 ) -> TokenStream {
+    let cost_estimates = HashMap::from([
+        (SymNode::Const(0), 0),
+        (SymNode::Var(0), 0),
+        (SymNode::Add(0, 0), 1),
+        (SymNode::Sub(0, 0), 1),
+        (SymNode::Mul(0, 0), 1),
+        (SymNode::Div(0, 0), 15),
+        (SymNode::Powi(0, 0), 3),
+        (SymNode::Neg(0), 0),
+        (SymNode::Sin(0), 100),
+        (SymNode::Cos(0), 100),
+        (SymNode::Ln(0), 60),
+        (SymNode::Exp(0), 60),
+        (SymNode::Sqrt(0), 5),
+    ]);
+
     // Differentiate with respect to variable var_idx
     let diff_transformer = DiffTransformer::new(var_idx);
     let mut root_id = arena.transform(root_id, &diff_transformer, &mut HashMap::new());
