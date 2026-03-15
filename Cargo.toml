@@ -1,6 +1,6 @@
 [package]
 name = "symdiff"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 
 description = "Compile-time symbolic differentiation for Rust via a proc-macro attribute. Generates closed-form gradients at compile time."

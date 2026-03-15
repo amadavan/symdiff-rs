@@ -2,13 +2,12 @@ use std::collections::HashMap;
 
 use crate::arena::{NodeId, SymArena, SymNode, SymTransformer};
 
-/// A [`SymTransformer`] that computes the symbolic derivative of every node
-/// with respect to a single variable `var` (identified by its [`NodeId`]).
+/// Computes the symbolic derivative of every node with respect to one variable.
 ///
-/// The rules applied are the standard calculus identities: sum rule, product
-/// rule, quotient rule, power rule, and chain rule for each transcendental.
+/// Applies standard calculus rules: sum, product, quotient, power, and chain
+/// rule for each transcendental.
 pub struct DiffTransformer {
-    /// The variable we are differentiating with respect to.
+    /// Index of the variable to differentiate with respect to.
     var: NodeId,
 }
 
@@ -25,7 +24,6 @@ impl SymTransformer for DiffTransformer {
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        // Derivative of a constant is zero
         arena.intern(SymNode::Const(0))
     }
 
@@ -36,10 +34,8 @@ impl SymTransformer for DiffTransformer {
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
         if idx == self.var {
-            // Derivative of the variable with respect to itself is one
             arena.intern(SymNode::Const(1.0_f64.to_bits()))
         } else {
-            // Derivative of other variables is zero
             arena.intern(SymNode::Const(0.0_f64.to_bits()))
         }
     }
@@ -190,23 +186,13 @@ impl SymTransformer for DiffTransformer {
     }
 }
 
-/// A [`SymTransformer`] that algebraically simplifies an expression tree.
+/// Algebraically simplifies an expression tree via local rewrite rules.
 ///
-/// Each `process_*` method receives the already-simplified child ids (via the
-/// `diff` map) and applies a set of local rewrite rules before rebuilding the
-/// node.  Rules include:
-///
-/// - **Constant folding**: if all operands are `Const`, evaluate the operation
-///   at compile time and return a single `Const`.
-/// - **Identity / annihilator laws**: `0 + e = e`, `e * 1 = e`, `0 * e = 0`,
-///   `0 / e = 0`, `e / 1 = e`, `0 - e = -e`, `e - 0 = e`.
-/// - **Double negation**: `-(-e) = e`.
-/// - **Distributive factoring for `+`/`-`**: `a*b ± a*c = a*(b ± c)`.
-/// - **Power merging**: `b^m * b^n = b^(m+n)`, `b^m / b^n = b^(m-n)`.
-/// - **Exponential merging**: `exp(a) * exp(b) = exp(a+b)`,
-///   `exp(a) / exp(b) = exp(a-b)`.
-/// - **Logarithm of a power**: `ln(b^n) = n * ln(b)`.
-/// - **Square root of an even power**: `sqrt(b^(2k)) = b^k`.
+/// Rules applied (where applicable): constant folding, identity/annihilator
+/// laws (`0+e`, `1*e`, `0*e`, etc.), double negation, distributive factoring
+/// (`a*b ± a*c = a*(b±c)`), power merging (`b^m * b^n = b^(m+n)`),
+/// exponential merging (`exp(a)*exp(b) = exp(a+b)`), `ln(b^n) = n*ln(b)`,
+/// and `sqrt(b^(2k)) = b^k`.
 pub struct SimplifyTransformer {}
 
 impl SimplifyTransformer {
@@ -222,7 +208,6 @@ impl SymTransformer for SimplifyTransformer {
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        // Constants are already simplified
         arena.intern(SymNode::Const(value))
     }
 
@@ -232,7 +217,6 @@ impl SymTransformer for SimplifyTransformer {
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        // Variables are already simplified
         arena.intern(SymNode::Var(idx))
     }
 
@@ -243,7 +227,6 @@ impl SymTransformer for SimplifyTransformer {
         arena: &mut SymArena,
         diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        // Simplify addition
         let left_id = diff[&left];
         let right_id = diff[&right];
         let left_node = *arena.get_node(left_id);
@@ -251,37 +234,24 @@ impl SymTransformer for SimplifyTransformer {
 
         match (left_node, right_node) {
             (SymNode::Const(value1), SymNode::Const(value2)) => {
-                // Constant folding: if both sides are constants, evaluate them
-                let v1_bits = f64::from_bits(value1);
-                let v2_bits = f64::from_bits(value2);
-                let result_value = (v1_bits + v2_bits).to_bits();
+                let result_value = (f64::from_bits(value1) + f64::from_bits(value2)).to_bits();
                 return arena.intern(SymNode::Const(result_value));
             }
-            (SymNode::Const(v), _) if v == 0.0_f64.to_bits() => {
-                // 0 + e = e
-                return right_id;
-            }
-            (_, SymNode::Const(v)) if v == 0.0_f64.to_bits() => {
-                // e + 0 = e
-                return left_id;
-            }
+            (SymNode::Const(v), _) if v == 0.0_f64.to_bits() => return right_id,
+            (_, SymNode::Const(v)) if v == 0.0_f64.to_bits() => return left_id,
             (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1a == e2a => {
-                // (a*b) + (a*c) = a * (b+c)
                 let factored = arena.intern(SymNode::Add(e1b, e2b));
                 return arena.intern(SymNode::Mul(e1a, factored));
             }
             (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1a == e2b => {
-                // (a*b) + (c*a) = a * (b+c)
                 let factored = arena.intern(SymNode::Add(e1b, e2a));
                 return arena.intern(SymNode::Mul(e1a, factored));
             }
             (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1b == e2a => {
-                // (b*a) + (a*c) = a * (b+c)
                 let factored = arena.intern(SymNode::Add(e1a, e2b));
                 return arena.intern(SymNode::Mul(e1b, factored));
             }
             (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1b == e2b => {
-                // (b*a) + (c*a) = a * (b+c)
                 let factored = arena.intern(SymNode::Add(e1a, e2a));
                 return arena.intern(SymNode::Mul(e1b, factored));
             }
@@ -304,37 +274,26 @@ impl SymTransformer for SimplifyTransformer {
 
         match (left_node, right_node) {
             (SymNode::Const(value1), SymNode::Const(value2)) => {
-                // Constant folding: if both sides are constants, evaluate them
-                let v1_bits = f64::from_bits(value1);
-                let v2_bits = f64::from_bits(value2);
-                let result_value = (v1_bits - v2_bits).to_bits();
+                let result_value = (f64::from_bits(value1) - f64::from_bits(value2)).to_bits();
                 return arena.intern(SymNode::Const(result_value));
             }
             (SymNode::Const(v), _) if v == 0.0_f64.to_bits() => {
-                // 0 - e = -e
                 return arena.intern(SymNode::Neg(right_id));
             }
-            (_, SymNode::Const(v)) if v == 0.0_f64.to_bits() => {
-                // e - 0 = e
-                return left_id;
-            }
+            (_, SymNode::Const(v)) if v == 0.0_f64.to_bits() => return left_id,
             (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1a == e2a => {
-                // (a*b) - (a*c) = a * (b-c)
                 let factored = arena.intern(SymNode::Sub(e1b, e2b));
                 return arena.intern(SymNode::Mul(e1a, factored));
             }
             (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1a == e2b => {
-                // (a*b) - (c*a) = a * (b-c)
                 let factored = arena.intern(SymNode::Sub(e1b, e2a));
                 return arena.intern(SymNode::Mul(e1a, factored));
             }
             (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1b == e2a => {
-                // (b*a) - (a*c) = a * (b-c)
                 let factored = arena.intern(SymNode::Sub(e1a, e2b));
                 return arena.intern(SymNode::Mul(e1b, factored));
             }
             (SymNode::Mul(e1a, e1b), SymNode::Mul(e2a, e2b)) if e1b == e2b => {
-                // (b*a) - (c*a) = a * (b-c)
                 let factored = arena.intern(SymNode::Sub(e1a, e2a));
                 return arena.intern(SymNode::Mul(e1b, factored));
             }
@@ -357,31 +316,18 @@ impl SymTransformer for SimplifyTransformer {
 
         match (left_node, right_node) {
             (SymNode::Const(value1), SymNode::Const(value2)) => {
-                // Constant folding: if both sides are constants, evaluate them
-                let v1_bits = f64::from_bits(value1);
-                let v2_bits = f64::from_bits(value2);
-                let result_value = (v1_bits * v2_bits).to_bits();
+                let result_value = (f64::from_bits(value1) * f64::from_bits(value2)).to_bits();
                 return arena.intern(SymNode::Const(result_value));
             }
             (SymNode::Const(v), _) | (_, SymNode::Const(v)) if v == 0.0_f64.to_bits() => {
-                // 0 * e = 0, e * 0 = 0
                 return arena.intern(SymNode::Const(0.0_f64.to_bits()));
             }
-            (SymNode::Const(v), _) if v == 1.0_f64.to_bits() => {
-                // 1 * e = e
-                return right_id;
-            }
-            (_, SymNode::Const(v)) if v == 1.0_f64.to_bits() => {
-                // e * 1 = e
-                return left_id;
-            }
+            (SymNode::Const(v), _) if v == 1.0_f64.to_bits() => return right_id,
+            (_, SymNode::Const(v)) if v == 1.0_f64.to_bits() => return left_id,
             (SymNode::Powi(base1, exp1), SymNode::Powi(base2, exp2)) if base1 == base2 => {
-                // base^a * base^b = base^(a+b)
-                let new_exp = exp1 + exp2;
-                return arena.intern(SymNode::Powi(base1, new_exp));
+                return arena.intern(SymNode::Powi(base1, exp1 + exp2));
             }
             (SymNode::Exp(e1), SymNode::Exp(e2)) => {
-                // exp(a) * exp(b) = exp(a+b)
                 let new_exp = arena.intern(SymNode::Add(e1, e2));
                 return arena.intern(SymNode::Exp(new_exp));
             }
@@ -404,29 +350,19 @@ impl SymTransformer for SimplifyTransformer {
 
         match (left_node, right_node) {
             (SymNode::Const(value1), SymNode::Const(value2)) if value2 != 0.0_f64.to_bits() => {
-                // Constant folding: if both sides are constants, evaluate them
-                let v1_bits = f64::from_bits(value1);
-                let v2_bits = f64::from_bits(value2);
-                let result_value = (v1_bits / v2_bits).to_bits();
+                let result_value = (f64::from_bits(value1) / f64::from_bits(value2)).to_bits();
                 return arena.intern(SymNode::Const(result_value));
             }
             (SymNode::Const(v), _) if v == 0.0_f64.to_bits() => {
-                // 0 / e = 0
                 return arena.intern(SymNode::Const(0.0_f64.to_bits()));
             }
-            (_, SymNode::Const(v)) if v == 1.0_f64.to_bits() => {
-                // e / 1 = e
-                return left_id;
-            }
+            (_, SymNode::Const(v)) if v == 1.0_f64.to_bits() => return left_id,
             (SymNode::Exp(e1), SymNode::Exp(e2)) => {
-                // exp(a) / exp(b) = exp(a-b)
                 let new_exp = arena.intern(SymNode::Sub(e1, e2));
                 return arena.intern(SymNode::Exp(new_exp));
             }
             (SymNode::Powi(base1, exp1), SymNode::Powi(base2, exp2)) if base1 == base2 => {
-                // base^a / base^b = base^(a-b)
-                let new_exp = exp1 - exp2;
-                return arena.intern(SymNode::Powi(base1, new_exp));
+                return arena.intern(SymNode::Powi(base1, exp1 - exp2));
             }
             _ => {}
         }
@@ -445,10 +381,7 @@ impl SymTransformer for SimplifyTransformer {
 
         match base_node {
             SymNode::Const(value) => {
-                // Constant folding: if the base is a constant, evaluate it
-                let base_value = f64::from_bits(value);
-                let result_value = base_value.powi(exp).to_bits();
-                return arena.intern(SymNode::Const(result_value));
+                return arena.intern(SymNode::Const(f64::from_bits(value).powi(exp).to_bits()));
             }
             _ => {}
         }
@@ -466,15 +399,9 @@ impl SymTransformer for SimplifyTransformer {
 
         match operand_node {
             SymNode::Const(value) => {
-                // -c = (-c) for constants
-                let c = f64::from_bits(value);
-                let neg_c = -c;
-                return arena.intern(SymNode::Const(neg_c.to_bits()));
+                return arena.intern(SymNode::Const((-f64::from_bits(value)).to_bits()));
             }
-            SymNode::Neg(inner) => {
-                // --e = e
-                return inner;
-            }
+            SymNode::Neg(inner) => return inner,
             _ => {}
         }
         arena.intern(SymNode::Neg(operand_id))
@@ -491,10 +418,7 @@ impl SymTransformer for SimplifyTransformer {
 
         match operand_node {
             SymNode::Const(value) => {
-                // sin(c) = c.sin() for constants
-                let c = f64::from_bits(value);
-                let sin_c = c.sin();
-                return arena.intern(SymNode::Const(sin_c.to_bits()));
+                return arena.intern(SymNode::Const(f64::from_bits(value).sin().to_bits()));
             }
             _ => {}
         }
@@ -512,10 +436,7 @@ impl SymTransformer for SimplifyTransformer {
 
         match operand_node {
             SymNode::Const(value) => {
-                // cos(c) = c.cos() for constants
-                let c = f64::from_bits(value);
-                let cos_c = c.cos();
-                return arena.intern(SymNode::Const(cos_c.to_bits()));
+                return arena.intern(SymNode::Const(f64::from_bits(value).cos().to_bits()));
             }
             _ => {}
         }
@@ -533,15 +454,13 @@ impl SymTransformer for SimplifyTransformer {
 
         match operand_node {
             SymNode::Const(value) => {
-                // ln(c) = c.ln() for positive constants
                 let c = f64::from_bits(value);
                 if c > 0.0 {
-                    let ln_c = c.ln();
-                    return arena.intern(SymNode::Const(ln_c.to_bits()));
+                    return arena.intern(SymNode::Const(c.ln().to_bits()));
                 }
             }
             SymNode::Powi(base, exp) => {
-                // ln(base^exp) = exp * ln(base)
+                // ln(b^n) = n * ln(b)
                 let ln_base = arena.intern(SymNode::Ln(base));
                 let exp_node = arena.intern(SymNode::Const((exp as f64).to_bits()));
                 return arena.intern(SymNode::Mul(exp_node, ln_base));
@@ -562,10 +481,7 @@ impl SymTransformer for SimplifyTransformer {
 
         match operand_node {
             SymNode::Const(value) => {
-                // exp(c) = c.exp() for constants
-                let c = f64::from_bits(value);
-                let exp_c = c.exp();
-                return arena.intern(SymNode::Const(exp_c.to_bits()));
+                return arena.intern(SymNode::Const(f64::from_bits(value).exp().to_bits()));
             }
             _ => {}
         }
@@ -583,17 +499,13 @@ impl SymTransformer for SimplifyTransformer {
 
         match operand_node {
             SymNode::Const(value) => {
-                // sqrt(c) = c.sqrt() for positive constants
                 let c = f64::from_bits(value);
                 if c >= 0.0 {
-                    let sqrt_c = c.sqrt();
-                    return arena.intern(SymNode::Const(sqrt_c.to_bits()));
+                    return arena.intern(SymNode::Const(c.sqrt().to_bits()));
                 }
             }
             SymNode::Powi(base, exp) if exp % 2 == 0 => {
-                // sqrt(base^(2k)) = base^k
-                let new_exp = exp / 2;
-                return arena.intern(SymNode::Powi(base, new_exp));
+                return arena.intern(SymNode::Powi(base, exp / 2));
             }
             _ => {}
         }
@@ -601,12 +513,9 @@ impl SymTransformer for SimplifyTransformer {
     }
 }
 
-pub struct CommutativeTransformer {
-    // This transformer will reorder the operands of commutative operations
-    // (like addition and multiplication) in a canonical way to enable better
-    // common sub-expression elimination.  For example, it might sort the
-    // operands by their node ids or by some hash of their structure.
-}
+/// Swaps operands of commutative operations (`+`, `*`) and rewrites division
+/// chains to expose more opportunities for common sub-expression elimination.
+pub struct CommutativeTransformer {}
 
 impl CommutativeTransformer {
     pub fn new() -> CommutativeTransformer {
@@ -717,22 +626,18 @@ impl SymTransformer for CommutativeTransformer {
         let right_node = *arena.get_node(right);
         match (left_node, right_node) {
             (SymNode::Mul(l1, l2), _) => {
-                // (a * b) / c = (a / c) * b
                 let new_left = arena.intern(SymNode::Div(l1, right));
                 return arena.intern(SymNode::Mul(new_left, l2));
             }
             (_, SymNode::Mul(r1, _)) => {
-                // a / (b * c) = (a / b) / c
                 let new_right = arena.intern(SymNode::Div(right, r1));
                 return arena.intern(SymNode::Div(left, new_right));
             }
             (SymNode::Div(l1, l2), _) => {
-                // (a / b) / c = a / (b * c)
                 let new_right = arena.intern(SymNode::Mul(l2, right));
                 return arena.intern(SymNode::Div(l1, new_right));
             }
             (_, SymNode::Div(r1, r2)) => {
-                // a / (b / c) = (a * c) / b
                 let new_left = arena.intern(SymNode::Mul(left, r2));
                 return arena.intern(SymNode::Div(new_left, r1));
             }
@@ -805,12 +710,9 @@ impl SymTransformer for CommutativeTransformer {
     }
 }
 
-pub struct AssociativeTransformer {
-    // This transformer will reorder the operands of associative operations
-    // (like addition and multiplication) into a right-associative form to
-    // enable better common sub-expression elimination.  For example, it might
-    // transform (a + b) + c into a + (b + c).
-}
+/// Re-brackets associative operations (`+`, `-`, `*`, `/`) to expose more
+/// opportunities for common sub-expression elimination.
+pub struct AssociativeTransformer {}
 
 impl AssociativeTransformer {
     pub fn new() -> AssociativeTransformer {
@@ -849,22 +751,18 @@ impl SymTransformer for AssociativeTransformer {
 
         match (left_node, right_node) {
             (SymNode::Add(l1, l2), _) => {
-                // (a + b) + c = a + (b + c)
                 let new_right = arena.intern(SymNode::Add(l2, right));
                 return arena.intern(SymNode::Add(l1, new_right));
             }
             (_, SymNode::Add(r1, r2)) => {
-                // a + (b + c) = (a + b) + c
                 let new_left = arena.intern(SymNode::Add(left, r1));
                 return arena.intern(SymNode::Add(new_left, r2));
             }
             (SymNode::Sub(l1, l2), _) => {
-                // (a - b) + c = a - (b - c)
                 let new_right = arena.intern(SymNode::Sub(l2, right));
                 return arena.intern(SymNode::Sub(l1, new_right));
             }
             (_, SymNode::Sub(r1, r2)) => {
-                // a + (b - c) = (a + b) - c
                 let new_left = arena.intern(SymNode::Add(left, r1));
                 return arena.intern(SymNode::Sub(new_left, r2));
             }
@@ -886,22 +784,18 @@ impl SymTransformer for AssociativeTransformer {
 
         match (left_node, right_node) {
             (SymNode::Add(l1, l2), _) => {
-                // (a + b) - c = a + (b - c)
                 let new_right = arena.intern(SymNode::Sub(l2, right));
                 return arena.intern(SymNode::Add(l1, new_right));
             }
             (_, SymNode::Add(r1, r2)) => {
-                // a - (b + c) = (a - b) - c
                 let new_left = arena.intern(SymNode::Sub(left, r1));
                 return arena.intern(SymNode::Sub(new_left, r2));
             }
             (SymNode::Sub(l1, l2), _) => {
-                // (a - b) - c = a - (b + c)
                 let new_right = arena.intern(SymNode::Add(l2, right));
                 return arena.intern(SymNode::Sub(l1, new_right));
             }
             (_, SymNode::Sub(r1, r2)) => {
-                // a - (b - c) = (a - b) + c
                 let new_left = arena.intern(SymNode::Sub(left, r1));
                 return arena.intern(SymNode::Add(new_left, r2));
             }
@@ -921,22 +815,18 @@ impl SymTransformer for AssociativeTransformer {
 
         match (left_node, right_node) {
             (SymNode::Mul(l1, l2), _) => {
-                // (a * b) * c = a * (b * c)
                 let new_right = arena.intern(SymNode::Mul(l2, right));
                 return arena.intern(SymNode::Mul(l1, new_right));
             }
             (_, SymNode::Mul(r1, r2)) => {
-                // a * (b * c) = (a * b) * c
                 let new_left = arena.intern(SymNode::Mul(left, r1));
                 return arena.intern(SymNode::Mul(new_left, r2));
             }
             (SymNode::Div(l1, l2), _) => {
-                // (a / b) * c = a * (c / b)
                 let new_right = arena.intern(SymNode::Div(right, l2));
                 return arena.intern(SymNode::Mul(l1, new_right));
             }
             (_, SymNode::Div(r1, r2)) => {
-                // a * (b / c) = (a * b) / c
                 let new_left = arena.intern(SymNode::Mul(left, r1));
                 return arena.intern(SymNode::Div(new_left, r2));
             }
@@ -956,22 +846,18 @@ impl SymTransformer for AssociativeTransformer {
 
         match (left_node, right_node) {
             (SymNode::Mul(l1, l2), _) => {
-                // (a * b) / c = a * (b / c)
                 let new_right = arena.intern(SymNode::Div(l2, right));
                 return arena.intern(SymNode::Mul(l1, new_right));
             }
             (_, SymNode::Mul(r1, r2)) => {
-                // a / (b * c) = (a / b) / c
                 let new_left = arena.intern(SymNode::Div(left, r1));
                 return arena.intern(SymNode::Div(new_left, r2));
             }
             (SymNode::Div(l1, l2), _) => {
-                // (a / b) / c = a / (b * c)
                 let new_right = arena.intern(SymNode::Mul(l2, right));
                 return arena.intern(SymNode::Div(l1, new_right));
             }
             (_, SymNode::Div(r1, r2)) => {
-                // a / (b / c) = (a * c) / b
                 let new_left = arena.intern(SymNode::Mul(left, r2));
                 return arena.intern(SymNode::Div(new_left, r1));
             }
@@ -998,20 +884,11 @@ impl SymTransformer for AssociativeTransformer {
         let operand_node = *arena.get_node(operand);
 
         match operand_node {
-            SymNode::Neg(inner) => {
-                // --e = e
-                return inner;
-            }
+            SymNode::Neg(inner) => return inner,
             SymNode::Const(value) => {
-                // -c = (-c) for constants
-                let c = f64::from_bits(value);
-                let neg_c = -c;
-                return arena.intern(SymNode::Const(neg_c.to_bits()));
+                return arena.intern(SymNode::Const((-f64::from_bits(value)).to_bits()));
             }
-            SymNode::Sub(l1, l2) => {
-                // -(a - b) = (b - a)
-                return arena.intern(SymNode::Sub(l2, l1));
-            }
+            SymNode::Sub(l1, l2) => return arena.intern(SymNode::Sub(l2, l1)),
             _ => arena.intern(SymNode::Neg(operand)),
         }
     }
@@ -1062,9 +939,9 @@ impl SymTransformer for AssociativeTransformer {
     }
 }
 
+/// Replaces node ids according to a fixed mapping. Used by [`GreedyCoordinator`]
+/// to propagate rewritten ids back through the tree after each optimization step.
 pub struct RemapTransformer<'a> {
-    // This transformer will remap variable indices according to a provided mapping.
-    // For example, it might be used to rename variables or to substitute one variable for another.
     mapping: &'a HashMap<NodeId, NodeId>,
 }
 

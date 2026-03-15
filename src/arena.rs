@@ -2,45 +2,34 @@ use std::collections::{HashMap, HashSet};
 
 pub type NodeId = usize;
 
-/// A single node in the symbolic expression tree.
+/// A node in the symbolic expression tree.
 ///
-/// All child references are [`NodeId`]s into the owning [`SymArena`].
-/// Constants are encoded as the raw `f64` bit pattern (`f64::to_bits`).
+/// Children are [`NodeId`]s into the owning [`SymArena`].
+/// Constants are stored as raw `f64` bit patterns (`f64::to_bits`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SymNode {
-    /// A numeric constant; the payload is `value.to_bits()`.
+    /// Numeric constant; payload is `value.to_bits()`.
     Const(u64),
-    /// The `idx`-th component of the input slice `x`, i.e. `x[idx]`.
+    /// Input variable `x[idx]`.
     Var(NodeId),
-    /// Addition: `left + right`.
     Add(NodeId, NodeId),
-    /// Subtraction: `left - right`.
     Sub(NodeId, NodeId),
-    /// Multiplication: `left * right`.
     Mul(NodeId, NodeId),
-    /// Division: `left / right`.
     Div(NodeId, NodeId),
-    /// Integer power: `base.powi(exp)`.
+    /// `base.powi(exp)` — exponent is a literal `i32`, not a node.
     Powi(NodeId, i32),
-    /// Arithmetic negation: `-operand`.
     Neg(NodeId),
-    /// Sine: `operand.sin()`.
     Sin(NodeId),
-    /// Cosine: `operand.cos()`.
     Cos(NodeId),
-    /// Natural logarithm: `operand.ln()`.
     Ln(NodeId),
-    /// Natural exponential: `operand.exp()`.
     Exp(NodeId),
-    /// Square root: `operand.sqrt()`.
     Sqrt(NodeId),
 }
 
-/// An interning arena for [`SymNode`]s.
+/// Interning arena for [`SymNode`]s.
 ///
-/// Nodes are stored in a flat `Vec` and looked up by index ([`NodeId`]).
-/// [`SymArena::intern`] guarantees that each structurally distinct node is
-/// stored at most once, so two equal nodes always get the same `NodeId`.
+/// Nodes live in a flat `Vec` indexed by [`NodeId`]. Equal nodes share a single
+/// id — see [`intern`](SymArena::intern).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymArena {
     nodes: Vec<SymNode>,
@@ -56,16 +45,16 @@ impl SymArena {
         }
     }
 
-    /// Return a reference to the node stored at `node_id`.
     pub fn get_node(&self, node_id: NodeId) -> &SymNode {
         &self.nodes[node_id]
     }
 
+    /// Look up the id of an already-interned node, if present.
     pub fn get_id(&self, sym: &SymNode) -> Option<NodeId> {
         self.lookup.get(sym).copied()
     }
 
-    /// Dispatch `node_id` to the matching `visitor` method and return the result.
+    /// Dispatch a single node to the matching visitor method.
     pub fn accept<V, T>(&self, node_id: NodeId, visitor: &mut V) -> T
     where
         V: SymVisitor<T>,
@@ -88,10 +77,7 @@ impl SymArena {
         }
     }
 
-    /// Insert `node` into the arena, returning its `NodeId`.
-    ///
-    /// If an identical node already exists, its existing id is returned instead
-    /// (hash-consing / structural sharing).
+    /// Insert `node`, returning its id. Returns the existing id if already present.
     pub fn intern(&mut self, node: SymNode) -> NodeId {
         if let Some(&idx) = self.lookup.get(&node) {
             idx
@@ -103,6 +89,7 @@ impl SymArena {
         }
     }
 
+    /// Apply `transformer` to `node_id` in isolation, without recursing into children.
     pub fn transform_single_node<T: SymTransformer>(
         &mut self,
         node_id: NodeId,
@@ -137,11 +124,7 @@ impl SymArena {
     }
 
     /// Apply `transformer` to every node reachable from `root` in bottom-up
-    /// topological order, returning the new `NodeId` that corresponds to `root`.
-    ///
-    /// `diff` is an *output* parameter populated by the caller (pass an empty
-    /// `HashMap`).  On return it maps each original `NodeId` to the transformed
-    /// `NodeId` produced by the transformer.
+    /// topological order, returning the transformed id for `root`.
     pub fn transform<T: SymTransformer>(&mut self, root: NodeId, transformer: &T) -> NodeId {
         let order = self.get_topological_order(root);
 
@@ -180,8 +163,7 @@ impl SymArena {
         diff_map[&root]
     }
 
-    /// Return the nodes reachable from `root_id` in bottom-up (post-order)
-    /// topological order, visiting each node exactly once.
+    /// Nodes reachable from `root_id` in post-order, each appearing once.
     pub fn get_topological_order(&self, root_id: NodeId) -> Vec<NodeId> {
         let mut visited = HashSet::new();
         let mut order = Vec::new();
@@ -224,12 +206,9 @@ impl SymArena {
 
 /// A rewriting pass over the expression tree.
 ///
-/// [`SymArena::transform`] calls one method per node in bottom-up topological
-/// order.  Each method receives the original child `NodeId`s plus a `diff` map
-/// that already contains the transformed ids for every child; implementors look
-/// up `diff[&child_id]` to obtain the rewritten child before building the new
-/// node.  The returned `NodeId` is then recorded in `diff` under the current
-/// node's id so parent nodes can find it in turn.
+/// [`SymArena::transform`] calls one method per node bottom-up. The `diff` map
+/// holds already-transformed ids for all children; look up `diff[&child]` to
+/// get the rewritten child before constructing the new node.
 pub trait SymTransformer {
     fn process_const(
         &self,
@@ -318,10 +297,8 @@ pub trait SymTransformer {
 
 /// A read-only visitor over the expression tree.
 ///
-/// [`SymArena::accept`] dispatches to the method matching the node kind.
-/// Unlike [`SymTransformer`], the visitor is responsible for recursing into
-/// children itself (by calling `arena.accept(child_id, self)`) if it needs
-/// their values.
+/// Unlike [`SymTransformer`], the visitor recurses manually — call
+/// `arena.accept(child_id, self)` from within each method as needed.
 pub trait SymVisitor<T> {
     fn visit_const(&mut self, value: u64, arena: &SymArena) -> T;
     fn visit_var(&mut self, idx: NodeId, arena: &SymArena) -> T;

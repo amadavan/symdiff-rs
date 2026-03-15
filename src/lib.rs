@@ -1,46 +1,71 @@
-//! Compile-time symbolic automatic differentiation.
+//! Compile-time symbolic differentiation via a proc-macro attribute.
 //!
-//! This crate provides the [`gradient`] proc-macro attribute, which parses a
-//! Rust function body at compile time, builds a symbolic expression tree,
-//! differentiates it analytically, simplifies the result, and emits a
-//! companion `{fn}_gradient` function containing the closed-form derivative.
+//! The [`gradient`] macro differentiates a Rust function analytically at
+//! compile time and emits a companion `{fn}_gradient` that returns the
+//! closed-form gradient as a fixed-size array. No numerical approximation,
+//! no runtime overhead beyond the arithmetic itself.
 //!
-//! # Usage
+//! # How it works
 //!
-//! Annotate a function that takes a slice `&[f64]` and returns `f64`:
+//! At compile time the macro:
+//!
+//! 1. Parses the function body into a symbolic expression tree.
+//! 2. Differentiates each component analytically using standard calculus rules.
+//! 3. Simplifies the result (constant folding, identity laws, CSE, etc.).
+//! 4. Applies greedy commutative/associative reordering to expose further
+//!    common sub-expressions.
+//! 5. Emits the gradient function with shared sub-expressions hoisted into
+//!    `let` bindings.
+//!
+//! # Example
 //!
 //! ```rust,ignore
 //! use symdiff::gradient;
 //!
 //! #[gradient(dim = 2)]
 //! fn rosenbrock(x: &[f64]) -> f64 {
-//!     (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2)
+//!     let a = 1.0 - x[0];
+//!     let b = x[1] - x[0].powi(2);
+//!     a.powi(2) + 100.0 * b.powi(2)
 //! }
 //!
-//! // The macro emits `rosenbrock` unchanged plus:
-//! // fn rosenbrock_gradient(x: &[f64]) -> [f64; 2] { [...] }
+//! // Generates rosenbrock unchanged, plus:
+//! // fn rosenbrock_gradient(x: &[f64]) -> [f64; 2] {
+//! //     let tmp0 = x[0].powi(1);   // shared sub-expressions hoisted
+//! //     ...
+//! //     [∂f/∂x[0], ∂f/∂x[1]]
+//! // }
+//!
+//! let g = rosenbrock_gradient(&[1.0, 1.0]);
+//! assert_eq!(g, [0.0, 0.0]); // minimum of the Rosenbrock function
 //! ```
 //!
-//! ## Attribute parameters
+//! # Attribute parameters
 //!
-//! | Parameter    | Type    | Description                                      |
-//! |--------------|---------|--------------------------------------------------|
-//! | `dim`        | `usize` | Number of components (length of the gradient)    |
-//! | `max_passes` | `usize` | Max simplification passes; optional, default 10  |
+//! - `dim: usize` — number of gradient components; must match the number of
+//!   `x[i]` indices used in the function body (required)
+//! - `max_passes: usize` — maximum simplification passes; default 10 (optional)
 //!
 //! # Supported syntax
 //!
-//! | Source form                             | Symbolic node       |
-//! |-----------------------------------------|---------------------|
-//! | `x[i]`                                  | `Var`               |
-//! | `1.0`, `2`                              | `Const`             |
-//! | `e + f`, `e - f`, `e * f`, `e / f`     | `Add/Sub/Mul/Div`   |
-//! | `-e`                                    | `Neg`               |
-//! | `e.sin()`, `e.cos()`                    | `Sin`, `Cos`        |
-//! | `e.ln()`, `e.exp()`, `e.sqrt()`         | `Ln`, `Exp`, `Sqrt` |
-//! | `e.powi(n)` (integer literal `n`)       | `Powi`              |
-//! | `(e)`, `e as f64`                       | transparent         |
-//! | anything else                           | compile-time panic  |
+//! The function body may contain `let` bindings followed by a bare tail
+//! expression. Within expressions, the following are supported:
+//!
+//! - Variables: `x[0]`, `x[1]`, … (integer literal indices only)
+//! - Numeric literals: `1`, `2.0`, etc.
+//! - Arithmetic: `+`, `-`, `*`, `/`, unary `-`
+//! - Methods: `powi(n)` (integer literal exponent), `sin`, `cos`, `ln`,
+//!   `exp`, `sqrt`
+//! - Transparent: parentheses, `as f64` casts, block expressions
+//!
+//! Anything else (closures, function calls, loops, …) causes a compile-time
+//! panic with a descriptive message.
+//!
+//! # Limitations
+//!
+//! - The input slice parameter must be named `x`.
+//! - `powi` exponents must be integer literals, not variables.
+//! - Conditional expressions and loops cannot be differentiated symbolically.
 mod arena;
 mod coordinator;
 mod transformers;
@@ -59,23 +84,6 @@ use visitors::{RefCountVisitor, ToTokenStreamVisitor};
 use crate::coordinator::{Coordinator, GreedyCoordinator};
 
 /// Parse a `syn` expression into the [`SymArena`], returning the root [`NodeId`].
-///
-/// Supported expression forms:
-///
-/// | Source                   | Result                        |
-/// |--------------------------|-------------------------------|
-/// | `1`, `2.0`               | `Const` (f64 bit pattern)     |
-/// | `x[i]`                   | `Var(i)`                      |
-/// | `a + b`, `a - b`         | `Add`, `Sub`                  |
-/// | `a * b`, `a / b`         | `Mul`, `Div`                  |
-/// | `-e`                     | `Neg`                         |
-/// | `e.powi(n)`              | `Powi` (n must be an integer literal) |
-/// | `e.sin()`, `e.cos()`     | `Sin`, `Cos`                  |
-/// | `e.ln()`, `e.exp()`      | `Ln`, `Exp`                   |
-/// | `e.sqrt()`               | `Sqrt`                        |
-/// | `(e)`, `e as T`, `{e}`   | transparent — inner expr used |
-///
-/// # Panics
 ///
 /// Panics on any unsupported expression form.
 fn parse_syn(arena: &mut SymArena, expr: &Expr, env: &HashMap<syn::Ident, NodeId>) -> NodeId {
@@ -181,12 +189,9 @@ fn parse_syn(arena: &mut SymArena, expr: &Expr, env: &HashMap<syn::Ident, NodeId
     }
 }
 
-/// Differentiate `root_id` symbolically with respect to `var_idx`, simplify
-/// the result, and emit it as a `TokenStream`.
-///
-/// The emitted tokens represent a single `f64` expression (no surrounding
-/// function definition).  Common sub-expressions that appear more than once are
-/// hoisted into `let` bindings by [`ToTokenStreamVisitor`].
+/// Differentiate `root_id` with respect to `var_idx`, simplify the result, and
+/// emit it as a `TokenStream` (a bare `f64` expression, no function wrapper).
+/// Common sub-expressions are hoisted into `let` bindings.
 fn compile_expression(
     arena: &mut SymArena,
     root_id: NodeId,
@@ -246,15 +251,11 @@ fn compile_expression(
     (instruction_tokens, gradient_tokens)
 }
 
-/// Walk a function body block and return the symbolic form of its return value.
+/// Walk a function body and return its environment and tail expression.
 ///
-/// The body must consist of zero or more `let` bindings followed by a
-/// bare expression (no trailing semicolon).  Each `let` binding is converted
-/// to a [`SymExpr`] and stored in a name → expression map so that subsequent
-/// uses of the bound name are inlined symbolically.
-///
-/// Returns `None` if no bare tail expression is found (e.g. the body ends with
-/// a semicolon-terminated statement or is empty.
+/// Expects zero or more `let` bindings followed by a bare return expression.
+/// Bound names are stored so later uses are inlined symbolically. Returns
+/// `None` for the tail if the body ends with a semicolon or is empty.
 fn parse_body(
     arena: &mut SymArena,
     block: &syn::Block,
@@ -298,18 +299,12 @@ fn parse_body(
 struct DerivativeInput {
     /// Number of gradient components, i.e. the length of the output array.
     dim: usize,
-    /// Maximum number of simplification passes to perform; defaults to 10 if not specified.
+    /// Maximum simplification passes; defaults to 10.
     max_passes: Option<usize>,
 }
 
-/// Derive a gradient function for the annotated `fn` at compile time.
-///
-/// Emits the original function unchanged, plus a companion
-/// `{fn_name}_gradient` with the same signature but returning `[f64; dim]`
-/// whose `i`-th element is `∂f/∂arg[i]`.
-///
-/// See the [crate-level documentation](self) for the full attribute syntax and
-/// the list of supported source expressions.
+/// Emit the original function unchanged, plus `{fn}_gradient(x: &[f64]) -> [f64; dim]`
+/// where element `i` is `∂f/∂x[i]` in closed form.
 #[proc_macro_attribute]
 pub fn gradient(
     attr: proc_macro::TokenStream,

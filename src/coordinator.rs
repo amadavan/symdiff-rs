@@ -7,15 +7,24 @@ use crate::{
     visitors::CostEstimateVisitor,
 };
 
+/// Optimizes an expression tree to reduce evaluation cost.
 pub trait Coordinator {
     fn optimize(&self, root: NodeId, arena: &mut SymArena) -> NodeId;
 }
 
+/// Greedy node-by-node optimizer.
+///
+/// For each node in post-order, considers up to five rewrites (commute,
+/// associate, and their combinations), simplifies each candidate, picks the
+/// cheapest by the provided cost table, and commits that choice before moving
+/// to the next node.
 pub struct GreedyCoordinator<'a> {
     costs: &'a HashMap<SymNode, usize>,
 }
 
 impl<'a> GreedyCoordinator<'a> {
+    /// `costs` maps node variants (with placeholder ids) to their estimated
+    /// evaluation cost; see `compile_expression` in `lib.rs`.
     pub fn new(costs: &'a HashMap<SymNode, usize>) -> GreedyCoordinator<'a> {
         GreedyCoordinator { costs }
     }

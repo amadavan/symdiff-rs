@@ -6,6 +6,8 @@ use syn::Ident;
 
 use crate::arena::{NodeId, SymArena, SymNode, SymVisitor};
 
+/// Estimates the total evaluation cost of an expression tree by summing
+/// per-node costs from a provided table (see `compile_expression` in `lib.rs`).
 pub struct CostEstimateVisitor<'a> {
     costs: &'a HashMap<SymNode, usize>,
 }
@@ -85,12 +87,9 @@ impl<'a> SymVisitor<usize> for CostEstimateVisitor<'a> {
     }
 }
 
-/// A [`SymVisitor`] that counts how many times each [`NodeId`] is referenced
-/// in the sub-tree rooted at the visited node.
-///
-/// The resulting counts are used by [`ToTokenStreamVisitor`] to decide which
-/// sub-expressions are worth hoisting into a `let` binding for common
-/// sub-expression elimination (CSE).
+/// Counts how many times each [`NodeId`] is referenced in a subtree.
+/// [`ToTokenStreamVisitor`] uses these counts to decide what to hoist into a
+/// `let` binding for CSE.
 pub struct RefCountVisitor {
     counts: HashMap<NodeId, usize>,
 }
@@ -102,7 +101,6 @@ impl RefCountVisitor {
         }
     }
 
-    /// Return the reference-count map populated during the walk.
     pub fn get_counts(&self) -> &HashMap<NodeId, usize> {
         &self.counts
     }
@@ -209,20 +207,13 @@ impl SymVisitor<()> for RefCountVisitor {
     }
 }
 
-/// A [`SymVisitor`] that emits a `proc_macro2::TokenStream` for an expression
-/// tree, performing simple common sub-expression elimination (CSE).
-///
-/// Nodes whose reference count (from [`RefCountVisitor`]) exceeds 1 are hoisted
-/// into `let tmpN = …;` bindings stored in `instructions`, and subsequent uses
-/// of the same node emit a reference to that temporary rather than recomputing
-/// the expression.
+/// Emits a `TokenStream` for an expression tree, hoisting nodes referenced
+/// more than once into `let tmpN = …;` bindings (CSE).
 pub struct ToTokenStreamVisitor<'a> {
-    /// Per-node reference counts used to decide when CSE is worthwhile.
     counts: &'a HashMap<NodeId, usize>,
-    /// Cache mapping a `NodeId` to the token stream that represents it (either
-    /// the full expression or a reference to the hoisted temporary).
+    /// Maps a `NodeId` to its emitted tokens (inline expr or tmp reference).
     cache: HashMap<NodeId, TokenStream>,
-    /// Accumulated `let` bindings for hoisted sub-expressions, in emission order.
+    /// Accumulated `let` bindings in emission order.
     instructions: Vec<TokenStream>,
 }
 
@@ -235,20 +226,17 @@ impl<'a> ToTokenStreamVisitor<'a> {
         }
     }
 
+    /// The accumulated `let` bindings, in the order they must be emitted.
     pub fn get_instructions(&self) -> &[TokenStream] {
         &self.instructions
     }
 
-    /// Given the tokens for `node_id`, either return them directly (if the node
-    /// is only used once) or hoist them into a `let` binding and return a
-    /// reference to the temporary (if the node is used more than once).
+    /// Returns tokens for `node_id`, hoisting into a `let` tmp if ref count > 1.
     fn write_token(&mut self, node_id: NodeId, tokens: TokenStream) -> TokenStream {
-        // Check if the value is already cached
         if let Some(token) = self.cache.get(&node_id) {
             return token.clone();
         }
 
-        // Check if multiple references to this node exist and if so, store the instruction in a temporary variable and cache resul
         if *self.counts.get(&node_id).unwrap_or(&0) > 1 {
             let temp_var =
                 syn::Ident::new(&format!("tmp{}", node_id), proc_macro2::Span::call_site());
