@@ -213,7 +213,13 @@ fn compile_expression(
 
     // Commutative and associative reordering to canonicalize expressions and expose more common sub-expressions.
     let greedy_coordinator = GreedyCoordinator::new(&cost_estimates);
-    root_id = greedy_coordinator.optimize(root_id, arena);
+    for _ in 0..max_passes {
+        let new_root_id = greedy_coordinator.optimize(root_id, arena);
+        if new_root_id == root_id {
+            break; // No further optimization possible
+        }
+        root_id = new_root_id;
+    }
 
     // Reference counting for common sub-expression elimination
     let mut ref_count_visitor = RefCountVisitor::new();

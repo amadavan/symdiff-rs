@@ -7,7 +7,7 @@ fn add(x: &[f64]) -> f64 {
     3.0 * x[0] + 4.0 * x[1]
 }
 
-#[gradient(dim = 2)]
+#[gradient(dim = 2, max_passes = 5)]
 fn subtract(x: &[f64]) -> f64 {
     3.0 * x[0] - 4.0 * x[1]
 }
