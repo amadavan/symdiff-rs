@@ -73,7 +73,6 @@ mod visitors;
 
 use std::collections::HashMap;
 
-use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Expr, Pat, Stmt};
 
@@ -190,14 +189,13 @@ fn parse_syn(arena: &mut SymArena, expr: &Expr, env: &HashMap<syn::Ident, NodeId
 }
 
 /// Differentiate `root_id` with respect to `var_idx`, simplify the result, and
-/// emit it as a `TokenStream` (a bare `f64` expression, no function wrapper).
-/// Common sub-expressions are hoisted into `let` bindings.
+/// emit the `root_id` of the simplified expression.
 fn compile_expression(
     arena: &mut SymArena,
     root_id: NodeId,
     var_idx: usize,
     max_passes: usize,
-) -> (Vec<TokenStream>, TokenStream) {
+) -> NodeId {
     let cost_estimates = HashMap::from([
         (SymNode::Const(0), 0),
         (SymNode::Var(0), 0),
@@ -238,17 +236,7 @@ fn compile_expression(
         root_id = new_root_id;
     }
 
-    // Reference counting for common sub-expression elimination
-    let mut ref_count_visitor = RefCountVisitor::new();
-    arena.accept(root_id, &mut ref_count_visitor);
-    let ref_counts = ref_count_visitor.get_counts();
-
-    let mut to_tokens_visitor = ToTokenStreamVisitor::new(&ref_counts);
-    let gradient_tokens = arena.accept(root_id, &mut to_tokens_visitor);
-    let instruction_tokens = to_tokens_visitor.get_instructions().to_vec();
-
-    // Pass instructions and the final expression tokens back to the caller so they can be emitted together.
-    (instruction_tokens, gradient_tokens)
+    root_id
 }
 
 /// Walk a function body and return its environment and tail expression.
@@ -333,19 +321,23 @@ pub fn gradient(
         .map(|i| compile_expression(&mut arena, root, i, max_passes.unwrap_or(10)))
         .collect::<Vec<_>>();
 
+    // Count all references to each node to determine which sub-expressions are shared and should be hoisted into `let` bindings.
+    let mut ref_count = RefCountVisitor::new();
+    tokens.iter().for_each(|t| arena.accept(*t, &mut ref_count));
+
+    let mut cache = HashMap::new();
+    let mut instructions = Vec::new();
+
+    // Generate tokens for the gradient expression, hoisting any shared sub-expressions into `let` bindings and caching their tokens for reuse.
+    let mut to_tokens_visitor =
+        ToTokenStreamVisitor::new(&ref_count.get_counts(), &mut cache, &mut instructions);
     let gradient_tokens = tokens
         .iter()
-        .map(|(_, expr)| {
-            quote! {
-                #expr
-            }
-        })
+        .map(|t| arena.accept(*t, &mut to_tokens_visitor))
         .collect::<Vec<_>>();
 
-    let instruction_tokens = tokens
-        .iter()
-        .flat_map(|(instrs, _)| instrs)
-        .collect::<Vec<_>>();
+    // Get the emitted `let` bindings in the order they must be emitted.
+    let instruction_tokens = to_tokens_visitor.get_instructions().to_vec();
 
     let grad_name = syn::Ident::new(
         &format!("{}_gradient", fn_name),

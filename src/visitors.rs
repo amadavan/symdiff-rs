@@ -212,17 +212,21 @@ impl SymVisitor<()> for RefCountVisitor {
 pub struct ToTokenStreamVisitor<'a> {
     counts: &'a HashMap<NodeId, usize>,
     /// Maps a `NodeId` to its emitted tokens (inline expr or tmp reference).
-    cache: HashMap<NodeId, TokenStream>,
+    cache: &'a mut HashMap<NodeId, TokenStream>,
     /// Accumulated `let` bindings in emission order.
-    instructions: Vec<TokenStream>,
+    instructions: &'a mut Vec<TokenStream>,
 }
 
 impl<'a> ToTokenStreamVisitor<'a> {
-    pub fn new(counts: &'a HashMap<NodeId, usize>) -> ToTokenStreamVisitor<'a> {
+    pub fn new(
+        counts: &'a HashMap<NodeId, usize>,
+        cache: &'a mut HashMap<NodeId, TokenStream>,
+        instructions: &'a mut Vec<TokenStream>,
+    ) -> ToTokenStreamVisitor<'a> {
         ToTokenStreamVisitor {
             counts,
-            cache: HashMap::new(),
-            instructions: Vec::new(),
+            cache,
+            instructions,
         }
     }
 
@@ -240,10 +244,12 @@ impl<'a> ToTokenStreamVisitor<'a> {
         if *self.counts.get(&node_id).unwrap_or(&0) > 1 {
             let temp_var =
                 syn::Ident::new(&format!("tmp{}", node_id), proc_macro2::Span::call_site());
-            let temp_token = quote! { let #temp_var = #tokens; };
-            self.instructions.push(temp_token);
+
             let temp_token_stream = quote! { #temp_var };
-            self.cache.insert(node_id, temp_token_stream.clone());
+            // If the instruction has not already been cached, cache it and add a let binding for it.
+            if let None = self.cache.insert(node_id, temp_token_stream.clone()) {
+                self.instructions.push(quote! { let #temp_var = #tokens; });
+            }
             return temp_token_stream;
         }
 
