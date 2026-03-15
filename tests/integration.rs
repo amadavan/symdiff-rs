@@ -37,6 +37,11 @@ fn rosenbrock(x: &[f64]) -> f64 {
     (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2)
 }
 
+#[gradient(dim = 2, max_passes = 0)]
+fn rosenbrock_unsimplified(x: &[f64]) -> f64 {
+    (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2)
+}
+
 #[gradient(dim = 1)]
 fn trig(x: &[f64]) -> f64 {
     x[0].sin() + x[0].cos().powi(2)
