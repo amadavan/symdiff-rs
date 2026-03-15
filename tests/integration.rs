@@ -7,7 +7,7 @@ fn add(x: &[f64]) -> f64 {
     3.0 * x[0] + 4.0 * x[1]
 }
 
-#[gradient(dim = 2)]
+#[gradient(dim = 2, max_passes = 5)]
 fn subtract(x: &[f64]) -> f64 {
     3.0 * x[0] - 4.0 * x[1]
 }
@@ -127,11 +127,11 @@ mod test {
         assert!((g[0] - 1.0).abs() < 1e-10, "df/dx = {}", g[0]);
     }
 
-    // #[test]
-    // fn let_binding_inlining() {
-    //     // f = x² + 2y  →  df/dx = 2x, df/dy = 2
-    //     let g = with_lets_gradient(&[3.0, 5.0]);
-    //     assert!((g[0] - 6.0).abs() < 1e-10, "df/dx = {}", g[0]);
-    //     assert!((g[1] - 2.0).abs() < 1e-10, "df/dy = {}", g[1]);
-    // }
+    #[test]
+    fn let_binding_inlining() {
+        // f = x² + 2y  →  df/dx = 2x, df/dy = 2
+        let g = with_lets_gradient(&[3.0, 5.0]);
+        assert!((g[0] - 6.0).abs() < 1e-10, "df/dx = {}", g[0]);
+        assert!((g[1] - 2.0).abs() < 1e-10, "df/dy = {}", g[1]);
+    }
 }
