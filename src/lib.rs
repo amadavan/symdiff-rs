@@ -78,7 +78,7 @@ use crate::coordinator::{Coordinator, GreedyCoordinator};
 /// # Panics
 ///
 /// Panics on any unsupported expression form.
-fn parse_syn(arena: &mut SymArena, expr: &Expr) -> NodeId {
+fn parse_syn(arena: &mut SymArena, expr: &Expr, env: &HashMap<syn::Ident, NodeId>) -> NodeId {
     match expr {
         Expr::Lit(lit) => match &lit.lit {
             syn::Lit::Int(int_lit) => {
@@ -113,9 +113,21 @@ fn parse_syn(arena: &mut SymArena, expr: &Expr) -> NodeId {
             }
         }
 
+        Expr::Path(path_expr) => {
+            if let Some(ident) = path_expr.path.get_ident() {
+                if let Some(node_id) = env.get(ident) {
+                    return *node_id;
+                } else {
+                    panic!("Undefined variable: {}", ident);
+                }
+            } else {
+                panic!("Unsupported path expression");
+            }
+        }
+
         Expr::Binary(bin_expr) => {
-            let left_id = parse_syn(arena, &bin_expr.left);
-            let right_id = parse_syn(arena, &bin_expr.right);
+            let left_id = parse_syn(arena, &bin_expr.left, env);
+            let right_id = parse_syn(arena, &bin_expr.right, env);
             return match bin_expr.op {
                 syn::BinOp::Add(_) => arena.intern(SymNode::Add(left_id, right_id)),
                 syn::BinOp::Sub(_) => arena.intern(SymNode::Sub(left_id, right_id)),
@@ -126,7 +138,7 @@ fn parse_syn(arena: &mut SymArena, expr: &Expr) -> NodeId {
         }
 
         Expr::Unary(un) => {
-            let operand_id = parse_syn(arena, &un.expr);
+            let operand_id = parse_syn(arena, &un.expr, env);
             return match un.op {
                 syn::UnOp::Neg(_) => arena.intern(SymNode::Neg(operand_id)),
                 _ => panic!("Unsupported unary operator"),
@@ -134,7 +146,7 @@ fn parse_syn(arena: &mut SymArena, expr: &Expr) -> NodeId {
         }
 
         Expr::MethodCall(call) => {
-            let receiver_id = parse_syn(arena, &call.receiver);
+            let receiver_id = parse_syn(arena, &call.receiver, env);
             let method_name = call.method.to_string();
             return match method_name.as_str() {
                 "powi" => {
@@ -161,9 +173,9 @@ fn parse_syn(arena: &mut SymArena, expr: &Expr) -> NodeId {
             };
         }
 
-        Expr::Paren(paren) => parse_syn(arena, &paren.expr),
-        Expr::Group(group) => parse_syn(arena, &group.expr),
-        Expr::Cast(c) => parse_syn(arena, &c.expr),
+        Expr::Paren(paren) => parse_syn(arena, &paren.expr, env),
+        Expr::Group(group) => parse_syn(arena, &group.expr, env),
+        Expr::Cast(c) => parse_syn(arena, &c.expr, env),
 
         _ => panic!("Unsupported expression type {:?}", expr),
     }
@@ -180,7 +192,7 @@ fn compile_expression(
     root_id: NodeId,
     var_idx: usize,
     max_passes: usize,
-) -> TokenStream {
+) -> (Vec<TokenStream>, TokenStream) {
     let cost_estimates = HashMap::from([
         (SymNode::Const(0), 0),
         (SymNode::Var(0), 0),
@@ -227,7 +239,11 @@ fn compile_expression(
     let ref_counts = ref_count_visitor.get_counts();
 
     let mut to_tokens_visitor = ToTokenStreamVisitor::new(&ref_counts);
-    arena.accept(root_id, &mut to_tokens_visitor)
+    let gradient_tokens = arena.accept(root_id, &mut to_tokens_visitor);
+    let instruction_tokens = to_tokens_visitor.get_instructions().to_vec();
+
+    // Pass instructions and the final expression tokens back to the caller so they can be emitted together.
+    (instruction_tokens, gradient_tokens)
 }
 
 /// Walk a function body block and return the symbolic form of its return value.
@@ -238,19 +254,35 @@ fn compile_expression(
 /// uses of the bound name are inlined symbolically.
 ///
 /// Returns `None` if no bare tail expression is found (e.g. the body ends with
-/// a semicolon-terminated statement or is empty).
-fn parse_body(block: &syn::Block) -> Option<Expr> {
+/// a semicolon-terminated statement or is empty.
+fn parse_body(
+    arena: &mut SymArena,
+    block: &syn::Block,
+) -> (HashMap<syn::Ident, NodeId>, Option<Expr>) {
+    let mut env = HashMap::new();
+
     for stmt in &block.stmts {
         match stmt {
             Stmt::Local(local) => {
-                if let Pat::Ident(pat_ident) = &local.pat {
-                    let _name = pat_ident.ident.to_string();
-                    if let Some(init) = &local.init {
-                        return Some(init.expr.as_ref().clone());
+                let ident = match &local.pat {
+                    Pat::Ident(pat_ident) => Some(&pat_ident.ident),
+                    Pat::Type(pat_ident) => {
+                        if let Pat::Ident(inner_ident) = &*pat_ident.pat {
+                            Some(&inner_ident.ident)
+                        } else {
+                            None
+                        }
                     }
+                    _ => None,
+                };
+
+                if let (Some(name), Some(init)) = (ident, &local.init) {
+                    let expr = &init.expr;
+                    let node_id = parse_syn(arena, expr, &env);
+                    env.insert(name.clone(), node_id);
                 }
             }
-            Stmt::Expr(expr, None) => return Some(expr.clone()),
+            Stmt::Expr(expr, None) => return (env, Some(expr.clone())),
             _ => {
                 // Unsupported statement type (e.g. semi-colon terminated expr, item, macro).
                 // For simplicity, we require the function body to be a single expression.
@@ -258,7 +290,7 @@ fn parse_body(block: &syn::Block) -> Option<Expr> {
         }
     }
 
-    None
+    (env, None)
 }
 
 /// Parsed attribute arguments for [`gradient`].
@@ -292,17 +324,32 @@ pub fn gradient(
     let DerivativeInput { dim, max_passes } = deluxe::parse::<DerivativeInput>(attr.into())
         .expect("Failed to parse macro attribute arguments for gradient.");
 
-    let func_def = parse_body(body);
     let mut arena = SymArena::new();
+
+    let (env, func_def) = parse_body(&mut arena, body);
 
     if func_def.is_none() {
         panic!("Function body must end with a bare expression (no trailing semicolon).");
     }
 
-    let root = parse_syn(&mut arena, &func_def.unwrap());
+    let root = parse_syn(&mut arena, &func_def.unwrap(), &env);
 
-    let gradient_tokens = (0..dim)
+    let tokens = (0..dim)
         .map(|i| compile_expression(&mut arena, root, i, max_passes.unwrap_or(10)))
+        .collect::<Vec<_>>();
+
+    let gradient_tokens = tokens
+        .iter()
+        .map(|(_, expr)| {
+            quote! {
+                #expr
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let instruction_tokens = tokens
+        .iter()
+        .flat_map(|(instrs, _)| instrs)
         .collect::<Vec<_>>();
 
     let grad_name = syn::Ident::new(
@@ -314,6 +361,7 @@ pub fn gradient(
         #input_fn
 
         #vis fn #grad_name(x: &[f64]) -> [f64; #dim] {
+            #(#instruction_tokens)*
             [#(#gradient_tokens),*]
         }
     );

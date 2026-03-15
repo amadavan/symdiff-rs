@@ -61,6 +61,10 @@ impl SymArena {
         &self.nodes[node_id]
     }
 
+    pub fn get_id(&self, sym: &SymNode) -> Option<NodeId> {
+        self.lookup.get(sym).copied()
+    }
+
     /// Dispatch `node_id` to the matching `visitor` method and return the result.
     pub fn accept<V, T>(&self, node_id: NodeId, visitor: &mut V) -> T
     where

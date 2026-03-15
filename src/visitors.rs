@@ -235,10 +235,14 @@ impl<'a> ToTokenStreamVisitor<'a> {
         }
     }
 
+    pub fn get_instructions(&self) -> &[TokenStream] {
+        &self.instructions
+    }
+
     /// Given the tokens for `node_id`, either return them directly (if the node
     /// is only used once) or hoist them into a `let` binding and return a
     /// reference to the temporary (if the node is used more than once).
-    pub fn write_token(&mut self, node_id: NodeId, tokens: TokenStream) -> TokenStream {
+    fn write_token(&mut self, node_id: NodeId, tokens: TokenStream) -> TokenStream {
         // Check if the value is already cached
         if let Some(token) = self.cache.get(&node_id) {
             return token.clone();
@@ -246,7 +250,8 @@ impl<'a> ToTokenStreamVisitor<'a> {
 
         // Check if multiple references to this node exist and if so, store the instruction in a temporary variable and cache resul
         if *self.counts.get(&node_id).unwrap_or(&0) > 1 {
-            let temp_var = format!("tmp{}", node_id);
+            let temp_var =
+                syn::Ident::new(&format!("tmp{}", node_id), proc_macro2::Span::call_site());
             let temp_token = quote! { let #temp_var = #tokens; };
             self.instructions.push(temp_token);
             let temp_token_stream = quote! { #temp_var };
@@ -259,72 +264,108 @@ impl<'a> ToTokenStreamVisitor<'a> {
 }
 
 impl SymVisitor<TokenStream> for ToTokenStreamVisitor<'_> {
-    fn visit_const(&mut self, value: u64, _arena: &SymArena) -> TokenStream {
+    fn visit_const(&mut self, value: u64, arena: &SymArena) -> TokenStream {
         let f = f64::from_bits(value);
-        quote! { #f }
+        self.write_token(arena.get_id(&SymNode::Const(value)).unwrap(), quote! { #f })
     }
 
-    fn visit_var(&mut self, idx: NodeId, _arena: &SymArena) -> TokenStream {
+    fn visit_var(&mut self, idx: NodeId, arena: &SymArena) -> TokenStream {
         let var_name = Ident::new("x", proc_macro2::Span::call_site());
-        quote! { #var_name[#idx] }
+        self.write_token(
+            arena.get_id(&SymNode::Var(idx)).unwrap(),
+            quote! { #var_name[#idx] },
+        )
     }
 
     fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
         let left_tokens = arena.accept(left, self);
         let right_tokens = arena.accept(right, self);
-        quote! { (#left_tokens + #right_tokens) }
+        self.write_token(
+            arena.get_id(&SymNode::Add(left, right)).unwrap(),
+            quote! { (#left_tokens + #right_tokens) },
+        )
     }
 
     fn visit_sub(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
         let left_tokens = arena.accept(left, self);
         let right_tokens = arena.accept(right, self);
-        quote! { (#left_tokens - #right_tokens) }
+        self.write_token(
+            arena.get_id(&SymNode::Sub(left, right)).unwrap(),
+            quote! { (#left_tokens - #right_tokens) },
+        )
     }
 
     fn visit_mul(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
         let left_tokens = arena.accept(left, self);
         let right_tokens = arena.accept(right, self);
-        quote! { (#left_tokens * #right_tokens) }
+        self.write_token(
+            arena.get_id(&SymNode::Mul(left, right)).unwrap(),
+            quote! { (#left_tokens * #right_tokens) },
+        )
     }
 
     fn visit_div(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
         let left_tokens = arena.accept(left, self);
         let right_tokens = arena.accept(right, self);
-        quote! { (#left_tokens / #right_tokens) }
+        self.write_token(
+            arena.get_id(&SymNode::Div(left, right)).unwrap(),
+            quote! { (#left_tokens / #right_tokens) },
+        )
     }
 
     fn visit_powi(&mut self, base: NodeId, exp: i32, arena: &SymArena) -> TokenStream {
         let base_tokens = arena.accept(base, self);
-        quote! { (#base_tokens.powi(#exp)) }
+        self.write_token(
+            arena.get_id(&SymNode::Powi(base, exp)).unwrap(),
+            quote! { (#base_tokens.powi(#exp)) },
+        )
     }
 
     fn visit_neg(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
         let operand_tokens = arena.accept(operand, self);
-        quote! { (-#operand_tokens) }
+        self.write_token(
+            arena.get_id(&SymNode::Neg(operand)).unwrap(),
+            quote! { (-#operand_tokens) },
+        )
     }
 
     fn visit_sin(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
         let operand_tokens = arena.accept(operand, self);
-        quote! { (#operand_tokens.sin()) }
+        self.write_token(
+            arena.get_id(&SymNode::Sin(operand)).unwrap(),
+            quote! { (#operand_tokens.sin()) },
+        )
     }
 
     fn visit_cos(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
         let operand_tokens = arena.accept(operand, self);
-        quote! { (#operand_tokens.cos()) }
+        self.write_token(
+            arena.get_id(&SymNode::Cos(operand)).unwrap(),
+            quote! { (#operand_tokens.cos()) },
+        )
     }
 
     fn visit_ln(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
         let operand_tokens = arena.accept(operand, self);
-        quote! { (#operand_tokens.ln()) }
+        self.write_token(
+            arena.get_id(&SymNode::Ln(operand)).unwrap(),
+            quote! { (#operand_tokens.ln()) },
+        )
     }
 
     fn visit_exp(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
         let operand_tokens = arena.accept(operand, self);
-        quote! { (#operand_tokens.exp()) }
+        self.write_token(
+            arena.get_id(&SymNode::Exp(operand)).unwrap(),
+            quote! { (#operand_tokens.exp()) },
+        )
     }
 
     fn visit_sqrt(&mut self, operand: NodeId, arena: &SymArena) -> TokenStream {
         let operand_tokens = arena.accept(operand, self);
-        quote! { (#operand_tokens.sqrt()) }
+        self.write_token(
+            arena.get_id(&SymNode::Sqrt(operand)).unwrap(),
+            quote! { (#operand_tokens.sqrt()) },
+        )
     }
 }
