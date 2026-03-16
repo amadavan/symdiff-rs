@@ -385,6 +385,14 @@ impl SymTransformer for SimplifyTransformer {
             }
             _ => {}
         }
+
+        match exp {
+            0 => return arena.intern(SymNode::Const(1.0_f64.to_bits())),
+            1 => return base_id,
+            2 => return arena.intern(SymNode::Mul(base_id, base_id)),
+            _ => {}
+        }
+
         arena.intern(SymNode::Powi(base_id, exp))
     }
 
@@ -465,6 +473,10 @@ impl SymTransformer for SimplifyTransformer {
                 let exp_node = arena.intern(SymNode::Const((exp as f64).to_bits()));
                 return arena.intern(SymNode::Mul(exp_node, ln_base));
             }
+            SymNode::Exp(e) => {
+                // ln(exp(f)) = f
+                return e;
+            }
             _ => {}
         }
         arena.intern(SymNode::Ln(operand_id))
@@ -482,6 +494,10 @@ impl SymTransformer for SimplifyTransformer {
         match operand_node {
             SymNode::Const(value) => {
                 return arena.intern(SymNode::Const(f64::from_bits(value).exp().to_bits()));
+            }
+            SymNode::Ln(e) => {
+                // exp(ln(f)) = f
+                return e;
             }
             _ => {}
         }
@@ -611,6 +627,14 @@ impl SymTransformer for CommutativeTransformer {
             | (_, SymNode::Div(_, _)) => {
                 return arena.intern(SymNode::Mul(right, left));
             }
+            (SymNode::Neg(e1), _) => {
+                let new_right = arena.intern(SymNode::Neg(right));
+                return arena.intern(SymNode::Mul(e1, new_right));
+            }
+            (_, SymNode::Neg(e2)) => {
+                let new_left = arena.intern(SymNode::Neg(left));
+                return arena.intern(SymNode::Mul(new_left, e2));
+            }
             _ => arena.intern(SymNode::Mul(left, right)),
         }
     }
@@ -640,6 +664,14 @@ impl SymTransformer for CommutativeTransformer {
             (_, SymNode::Div(r1, r2)) => {
                 let new_left = arena.intern(SymNode::Mul(left, r2));
                 return arena.intern(SymNode::Div(new_left, r1));
+            }
+            (SymNode::Neg(e1), _) => {
+                let new_right = arena.intern(SymNode::Neg(right));
+                return arena.intern(SymNode::Div(e1, new_right));
+            }
+            (_, SymNode::Neg(e2)) => {
+                let new_left = arena.intern(SymNode::Neg(left));
+                return arena.intern(SymNode::Div(new_left, e2));
             }
             _ => arena.intern(SymNode::Div(left, right)),
         }
@@ -888,7 +920,20 @@ impl SymTransformer for AssociativeTransformer {
             SymNode::Const(value) => {
                 return arena.intern(SymNode::Const((-f64::from_bits(value)).to_bits()));
             }
+            SymNode::Add(l1, l2) => {
+                let new_left = arena.intern(SymNode::Neg(l1));
+                let new_right = arena.intern(SymNode::Neg(l2));
+                return arena.intern(SymNode::Add(new_left, new_right));
+            }
             SymNode::Sub(l1, l2) => return arena.intern(SymNode::Sub(l2, l1)),
+            SymNode::Mul(l1, l2) => {
+                let new_left = arena.intern(SymNode::Neg(l1));
+                return arena.intern(SymNode::Mul(new_left, l2));
+            }
+            SymNode::Div(l1, l2) => {
+                let new_left = arena.intern(SymNode::Neg(l1));
+                return arena.intern(SymNode::Div(new_left, l2));
+            }
             _ => arena.intern(SymNode::Neg(operand)),
         }
     }
