@@ -1,6 +1,6 @@
 [package]
 name = "symdiff"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 
 description = "Compile-time symbolic differentiation for Rust via a proc-macro attribute. Generates closed-form gradients at compile time."
@@ -13,10 +13,7 @@ keywords = ["symbolic", "differentiation", "proc-macro", "autodiff", "gradient"]
 categories = ["science", "mathematics", "no-std", "rust-patterns"]
 homepage = "https://github.com/amadavan/symdiff"
 
-exclude = [
-    "assets/*",
-    ".github/*",
-]
+exclude = ["assets/*", ".github/*"]
 
 [lib]
 proc-macro = true

@@ -35,7 +35,7 @@ the closed-form derivative — no allocations, no trait objects, no overhead.
 
 ```toml
 [dependencies]
-symdiff = "2.0.0"
+symdiff = "2.0.1"
 ```
 
 `#[gradient(...)]` accepts two parameters:
@@ -44,9 +44,12 @@ symdiff = "2.0.0"
 |--------------|---------|:--------:|---------------------------------------------------------|
 | `dim`        | `usize` | yes      | Number of partial derivatives (length of output array)  |
 | `max_passes` | `usize` | no       | Max simplification passes; default 10                   |
+| `sparse`     | `bool`  | no       | Output the gradient as sparse vector                    |
 
 The annotated function must have signature `fn name(x: &[f64]) -> f64`; the
-generated gradient has signature `fn name_gradient(x: &[f64]) -> [f64; dim]`.
+generated gradient has signature `fn name_gradient(x: &[f64]) -> [f64; dim]` for dense output and
+`fn name_gradient(x: &[f64]) => ([f64; reduced_dim], [f64; reduced_dim])`, where the first
+corresponds to the indices, and the second corresponds to the values.
 
 The function body may contain `let` bindings followed by a bare tail expression
 (no trailing semicolon). Bound names are substituted symbolically before differentiating.
