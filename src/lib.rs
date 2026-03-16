@@ -292,6 +292,9 @@ struct DerivativeInput {
     max_passes: Option<usize>,
     /// Specify whether to output data as sparse structures
     sparse: Option<bool>,
+    /// Specify whether to prune the tree after simplification
+    /// This operation may be expensive so diabled by default
+    prune: Option<bool>,
 }
 
 /// Emit the original function unchanged, plus `{fn}_gradient(x: &[f64]) -> [f64; dim]`
@@ -311,6 +314,7 @@ pub fn gradient(
         dim,
         max_passes,
         sparse,
+        prune,
     } = deluxe::parse::<DerivativeInput>(attr.into())
         .expect("Failed to parse macro attribute arguments for gradient.");
 
@@ -323,6 +327,11 @@ pub fn gradient(
     }
 
     let root = parse_syn(&mut arena, &func_def.unwrap(), &env);
+
+    if prune.unwrap_or(false) {
+        // Prune the expression tree to remove any nodes that are not ancestors of the root.
+        arena.prune(root);
+    }
 
     let tokens = (0..dim)
         .map(|i| compile_expression(&mut arena, root, i, max_passes.unwrap_or(10)))

@@ -40,11 +40,12 @@ symdiff = "2.0.1"
 
 `#[gradient(...)]` accepts two parameters:
 
-| Parameter    | Type    | Required | Description                                             |
-|--------------|---------|:--------:|---------------------------------------------------------|
-| `dim`        | `usize` | yes      | Number of partial derivatives (length of output array)  |
-| `max_passes` | `usize` | no       | Max simplification passes; default 10                   |
-| `sparse`     | `bool`  | no       | Output the gradient as sparse vector                    |
+| Parameter    | Type    | Required | Description                                                              |
+|--------------|---------|:--------:|--------------------------------------------------------------------------|
+| `dim`        | `usize` | yes      | Number of partial derivatives (length of output array)                   |
+| `max_passes` | `usize` | no       | Max simplification passes; default 10                                    |
+| `sparse`     | `bool`  | no       | Output the gradient as sparse vector                                     |
+| `prune`      | `bool`  | no       | Whether to prune the tree after derivative (expensive but lower memory)  |
 
 The annotated function must have signature `fn name(x: &[f64]) -> f64`; the
 generated gradient has signature `fn name_gradient(x: &[f64]) -> [f64; dim]` for dense output and

@@ -77,6 +77,26 @@ impl SymArena {
         }
     }
 
+    // Remove nodes unreachable from `root_id`, and reassign ids to be dense from 0.
+    // This operation may be expensive
+    pub fn prune(&mut self, root_id: NodeId) {
+        let order = self.get_topological_order(root_id);
+        let mut new_nodes = Vec::new();
+        let mut new_lookup = HashMap::new();
+        let mut remapping = HashMap::new();
+
+        for old_id in order {
+            let node = self.nodes[old_id];
+            let new_id = new_nodes.len();
+            new_nodes.push(node);
+            new_lookup.insert(node, new_id);
+            remapping.insert(old_id, new_id);
+        }
+
+        self.nodes = new_nodes;
+        self.lookup = new_lookup;
+    }
+
     /// Insert `node`, returning its id. Returns the existing id if already present.
     pub fn intern(&mut self, node: SymNode) -> NodeId {
         if let Some(&idx) = self.lookup.get(&node) {
