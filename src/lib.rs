@@ -66,7 +66,6 @@
 //! - The input slice parameter must be named `x`.
 //! - `powi` exponents must be integer literals, not variables.
 //! - Conditional expressions and loops cannot be differentiated symbolically.
-#![feature(proc_macro_totokens)]
 
 mod arena;
 mod coordinator;
