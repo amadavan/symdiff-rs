@@ -66,6 +66,7 @@
 //! - The input slice parameter must be named `x`.
 //! - `powi` exponents must be integer literals, not variables.
 //! - Conditional expressions and loops cannot be differentiated symbolically.
+
 mod arena;
 mod coordinator;
 mod transformers;
@@ -289,6 +290,8 @@ struct DerivativeInput {
     dim: usize,
     /// Maximum simplification passes; defaults to 10.
     max_passes: Option<usize>,
+    /// Specify whether to output data as sparse structures
+    sparse: Option<bool>,
 }
 
 /// Emit the original function unchanged, plus `{fn}_gradient(x: &[f64]) -> [f64; dim]`
@@ -304,7 +307,11 @@ pub fn gradient(
     let body = &input_fn.block;
     let vis = &input_fn.vis;
 
-    let DerivativeInput { dim, max_passes } = deluxe::parse::<DerivativeInput>(attr.into())
+    let DerivativeInput {
+        dim,
+        max_passes,
+        sparse,
+    } = deluxe::parse::<DerivativeInput>(attr.into())
         .expect("Failed to parse macro attribute arguments for gradient.");
 
     let mut arena = SymArena::new();
@@ -331,13 +338,44 @@ pub fn gradient(
     // Generate tokens for the gradient expression, hoisting any shared sub-expressions into `let` bindings and caching their tokens for reuse.
     let mut to_tokens_visitor =
         ToTokenStreamVisitor::new(&ref_count.get_counts(), &mut cache, &mut instructions);
-    let gradient_tokens = tokens
-        .iter()
-        .map(|t| arena.accept(*t, &mut to_tokens_visitor))
-        .collect::<Vec<_>>();
+
+    let (dim, gradient_token) = {
+        if sparse.unwrap_or(false) {
+            let sparse_tokens = tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| &SymNode::Const(0) != arena.get_node(**t))
+                .map(|(i, t)| (i, arena.accept(*t, &mut to_tokens_visitor)))
+                .collect::<Vec<_>>();
+            let indices = sparse_tokens
+                .iter()
+                .map(|(i, _)| quote! { #i })
+                .collect::<Vec<_>>();
+            let values = sparse_tokens
+                .iter()
+                .map(|(_, t)| t.clone())
+                .collect::<Vec<_>>();
+            (
+                sparse_tokens.len(),
+                quote! { ([#(#indices),*], [#(#values),*]) },
+            )
+        } else {
+            let dense_tokens = tokens
+                .iter()
+                .map(|t| arena.accept(*t, &mut to_tokens_visitor))
+                .collect::<Vec<_>>();
+            (dim, quote! { [#(#dense_tokens),*] })
+        }
+    };
 
     // Get the emitted `let` bindings in the order they must be emitted.
     let instruction_tokens = to_tokens_visitor.get_instructions().to_vec();
+
+    let return_type = if sparse.unwrap_or(false) {
+        quote! { ([usize; #dim], [f64; #dim]) }
+    } else {
+        quote! { [f64; #dim] }
+    };
 
     let grad_name = syn::Ident::new(
         &format!("{}_gradient", fn_name),
@@ -347,9 +385,9 @@ pub fn gradient(
     let expanded = quote!(
         #input_fn
 
-        #vis fn #grad_name(x: &[f64]) -> [f64; #dim] {
+        #vis fn #grad_name(x: &[f64]) -> #return_type {
             #(#instruction_tokens)*
-            [#(#gradient_tokens),*]
+            #gradient_token
         }
     );
 

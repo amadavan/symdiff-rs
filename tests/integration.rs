@@ -55,6 +55,11 @@ fn with_lets(x: &[f64]) -> f64 {
     a + b
 }
 
+#[gradient(dim = 3, sparse = true)]
+fn rosenbrock_sparse(x: &[f64]) -> f64 {
+    (1.0 - x[0]).powi(2) + 100.0 * (x[2] - x[0].powi(2)).powi(2)
+}
+
 mod test {
     use super::*;
 
@@ -138,5 +143,15 @@ mod test {
         let g = with_lets_gradient(&[3.0, 5.0]);
         assert!((g[0] - 6.0).abs() < 1e-10, "df/dx = {}", g[0]);
         assert!((g[1] - 2.0).abs() < 1e-10, "df/dy = {}", g[1]);
+    }
+
+    #[test]
+    fn rosenbrock_sparse_grad() {
+        // At (1, 0, 1), gradient of sparse Rosenbrock is (0, 0, 200).
+        let (i, v) = rosenbrock_sparse_gradient(&[0.0, 0.0, 0.0]);
+        assert_eq!(i, [0, 2]);
+        assert_eq!(v.len(), 2);
+        assert!((v[0] + 2.0).abs() < 1e-10, "df/dx = {}", v[0]);
+        assert!((v[1] - 0.0).abs() < 1e-10, "df/dz = {}", v[1]);
     }
 }

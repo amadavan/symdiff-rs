@@ -109,9 +109,8 @@ impl RefCountVisitor {
 impl SymVisitor<()> for RefCountVisitor {
     fn visit_const(&mut self, _value: u64, _arena: &SymArena) -> () {}
 
-    fn visit_var(&mut self, idx: NodeId, _arena: &SymArena) -> () {
-        self.counts.entry(idx).and_modify(|c| *c += 1).or_insert(1);
-    }
+    // Variables should always be referenced at least once and will be inlined
+    fn visit_var(&mut self, idx: NodeId, _arena: &SymArena) -> () {}
 
     fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> () {
         arena.accept(left, self);
@@ -258,17 +257,14 @@ impl<'a> ToTokenStreamVisitor<'a> {
 }
 
 impl SymVisitor<TokenStream> for ToTokenStreamVisitor<'_> {
-    fn visit_const(&mut self, value: u64, arena: &SymArena) -> TokenStream {
+    fn visit_const(&mut self, value: u64, _arena: &SymArena) -> TokenStream {
         let f = f64::from_bits(value);
-        self.write_token(arena.get_id(&SymNode::Const(value)).unwrap(), quote! { #f })
+        quote! { #f }
     }
 
-    fn visit_var(&mut self, idx: NodeId, arena: &SymArena) -> TokenStream {
+    fn visit_var(&mut self, idx: NodeId, _arena: &SymArena) -> TokenStream {
         let var_name = Ident::new("x", proc_macro2::Span::call_site());
-        self.write_token(
-            arena.get_id(&SymNode::Var(idx)).unwrap(),
-            quote! { #var_name[#idx] },
-        )
+        quote! { #var_name[#idx] }
     }
 
     fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
