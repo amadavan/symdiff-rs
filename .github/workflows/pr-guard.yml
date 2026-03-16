@@ -1,0 +1,19 @@
+name: PR Target Guard
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  check-target-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Enforce PRs to main come only from dev
+        if: github.event.pull_request.head.ref != 'dev' || github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Direct pull requests to 'main' are not allowed."
+          echo "Please open your pull request against the 'dev' branch instead."
+          echo "Only the 'dev' branch may be merged directly into 'main'."
+          exit 1
