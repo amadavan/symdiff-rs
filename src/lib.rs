@@ -341,6 +341,7 @@ pub fn gradient(
 
     let (dim, gradient_token) = {
         if sparse.unwrap_or(false) {
+            // For sparse output, we must emit both the values and indices
             let sparse_tokens = tokens
                 .iter()
                 .enumerate()

@@ -35,7 +35,7 @@ the closed-form derivative — no allocations, no trait objects, no overhead.
 
 ```toml
 [dependencies]
-symdiff = "1.0.0"
+symdiff = "2.0.1"
 ```
 
 `#[gradient(...)]` accepts two parameters:
