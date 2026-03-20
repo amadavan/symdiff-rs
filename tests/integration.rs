@@ -7,6 +7,11 @@ fn add(x: &[f64]) -> f64 {
     3.0 * x[0] + 4.0 * x[1]
 }
 
+#[gradient(var = x, dim = 2)]
+fn multivar(x: &[f64], y: &[f64]) -> f64 {
+    3.0 * x[0] * y[0] + 4.0 * x[1] * y[1]
+}
+
 #[gradient(var = x, dim = 2, max_passes = 5)]
 fn subtract(x: &[f64]) -> f64 {
     3.0 * x[0] - 4.0 * x[1]
@@ -68,6 +73,15 @@ mod test {
         let f = super::add(&[2.0, 3.0]);
         assert!((f - 18.0).abs() < 1e-10, "f = {}", f);
         let g = add_gradient(&[2.0, 3.0]);
+        assert!((g[0] - 3.0).abs() < 1e-10, "df/dx = {}", g[0]);
+        assert!((g[1] - 4.0).abs() < 1e-10, "df/dy = {}", g[1]);
+    }
+
+    #[test]
+    fn test_multi() {
+        let f = super::multivar(&[2.0, 3.0], &[1., 1.]);
+        assert!((f - 18.0).abs() < 1e-10, "f = {}", f);
+        let g = multivar_gradient(&[2.0, 3.0], &[1., 1.]);
         assert!((g[0] - 3.0).abs() < 1e-10, "df/dx = {}", g[0]);
         assert!((g[1] - 4.0).abs() < 1e-10, "df/dy = {}", g[1]);
     }

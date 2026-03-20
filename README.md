@@ -15,7 +15,7 @@ compiled, with no runtime cost.
 ```rust
 use symdiff::gradient;
 
-#[gradient(dim = 2)]
+#[gradient(var = x, dim = 2)]
 fn rosenbrock(x: &[f64]) -> f64 {
     (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2)
 }
@@ -42,14 +42,16 @@ symdiff = "2.0.1"
 
 | Parameter    | Type    | Required | Description                                                              |
 |--------------|---------|:--------:|--------------------------------------------------------------------------|
+| `var`        | `Ident` | yes      | Identifier of derivative variable (must be a parameter)                  |
 | `dim`        | `usize` | yes      | Number of partial derivatives (length of output array)                   |
 | `max_passes` | `usize` | no       | Max simplification passes; default 10                                    |
 | `sparse`     | `bool`  | no       | Output the gradient as sparse vector                                     |
+| `unchecked`  | `bool`  | no       | Access variables with unchecked (defaults to false)                      |
 | `prune`      | `bool`  | no       | Whether to prune the tree after derivative (expensive but lower memory)  |
 
-The annotated function must have signature `fn name(x: &[f64]) -> f64`; the
-generated gradient has signature `fn name_gradient(x: &[f64]) -> [f64; dim]` for dense output and
-`fn name_gradient(x: &[f64]) => ([f64; reduced_dim], [f64; reduced_dim])`, where the first
+The annotated function must have signature `fn name(x: &[f64], y: &[f64], ...) -> f64`; the
+generated gradient has signature `fn name_gradient(x: &[f64], y: &[f64], ...) -> [f64; dim]` for dense output and
+`fn name_gradient(x: &[f64], y: &[f64], ...) => ([f64; reduced_dim], [f64; reduced_dim])`, where the first
 corresponds to the indices, and the second corresponds to the values.
 
 The function body may contain `let` bindings followed by a bare tail expression
@@ -82,12 +84,11 @@ cascade — for example, `0 * f(x) + 1` needs two passes to reach `1`.
 
 This is an early-stage library with a narrow scope:
 
-- Only `f64` arithmetic. The input must be `x: &[f64]`; scalar parameters
+- Only `f64` arithmetic. The input parameters must be floating point slices (`&[f64]`); scalar parameters
   are not differentiated.
 - Only `powi` for powers. `powf` and anything not in the table above causes a
   compile-time panic.
 - `powi` exponents must be integer literals, not variables.
-- The input slice parameter must be named `x`.
 - No support for higher-order derivatives.
 
 ## Alternatives
