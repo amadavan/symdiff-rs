@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
+use syn::Ident;
+
 pub type NodeId = usize;
+pub type VarId = u8;
 
 /// A node in the symbolic expression tree.
 ///
@@ -11,7 +14,7 @@ pub enum SymNode {
     /// Numeric constant; payload is `value.to_bits()`.
     Const(u64),
     /// Input variable `x[idx]`.
-    Var(NodeId),
+    Var(VarId, NodeId),
     Add(NodeId, NodeId),
     Sub(NodeId, NodeId),
     Mul(NodeId, NodeId),
@@ -34,6 +37,10 @@ pub enum SymNode {
 pub struct SymArena {
     nodes: Vec<SymNode>,
     lookup: HashMap<SymNode, NodeId>,
+
+    /// Store variables for multi-variate lookup
+    vars: Vec<Ident>,
+    var_lookup: HashMap<Ident, VarId>,
 }
 
 impl SymArena {
@@ -42,6 +49,28 @@ impl SymArena {
         Self {
             nodes: Vec::new(),
             lookup: HashMap::new(),
+
+            vars: Vec::new(),
+            var_lookup: HashMap::new(),
+        }
+    }
+
+    pub fn get_var_id(&self, name: &Ident) -> Option<VarId> {
+        self.var_lookup.get(name).copied()
+    }
+
+    pub fn get_var_ident(&self, id: VarId) -> &Ident {
+        &self.vars[id as usize]
+    }
+
+    pub fn intern_var_ident(&mut self, name: &Ident) -> VarId {
+        if let Some(&idx) = self.var_lookup.get(name) {
+            idx
+        } else {
+            let idx = self.vars.len() as VarId;
+            self.vars.push(name.clone());
+            self.var_lookup.insert(name.clone(), idx);
+            idx
         }
     }
 
@@ -62,7 +91,7 @@ impl SymArena {
         let node = &self.nodes[node_id];
         match node {
             SymNode::Const(value) => visitor.visit_const(*value, self),
-            SymNode::Var(idx) => visitor.visit_var(*idx, self),
+            SymNode::Var(id, idx) => visitor.visit_var(*id, *idx, self),
             SymNode::Add(left, right) => visitor.visit_add(*left, *right, self),
             SymNode::Sub(left, right) => visitor.visit_sub(*left, *right, self),
             SymNode::Mul(left, right) => visitor.visit_mul(*left, *right, self),
@@ -118,7 +147,7 @@ impl SymArena {
         let node = self.nodes[node_id];
         match node {
             SymNode::Const(value) => transformer.process_const(value, self, &mut HashMap::new()),
-            SymNode::Var(idx) => transformer.process_var(idx, self, &mut HashMap::new()),
+            SymNode::Var(id, idx) => transformer.process_var(id, idx, self, &mut HashMap::new()),
             SymNode::Add(left, right) => {
                 transformer.process_add(left, right, self, &mut HashMap::new())
             }
@@ -154,7 +183,7 @@ impl SymArena {
             let node = self.nodes[i];
             let diff = match node {
                 SymNode::Const(value) => transformer.process_const(value, self, &mut diff_map),
-                SymNode::Var(idx) => transformer.process_var(idx, self, &mut diff_map),
+                SymNode::Var(id, idx) => transformer.process_var(id, idx, self, &mut diff_map),
                 SymNode::Add(left, right) => {
                     transformer.process_add(left, right, self, &mut diff_map)
                 }
@@ -199,7 +228,7 @@ impl SymArena {
                 stack.push((node_id, true));
                 // Add children
                 match node {
-                    SymNode::Const(_) | SymNode::Var(_) => {}
+                    SymNode::Const(_) | SymNode::Var(_, _) => {}
                     SymNode::Add(left, right)
                     | SymNode::Sub(left, right)
                     | SymNode::Mul(left, right)
@@ -238,6 +267,7 @@ pub trait SymTransformer {
     ) -> NodeId;
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         diff: &mut HashMap<NodeId, NodeId>,
@@ -321,7 +351,7 @@ pub trait SymTransformer {
 /// `arena.accept(child_id, self)` from within each method as needed.
 pub trait SymVisitor<T> {
     fn visit_const(&mut self, value: u64, arena: &SymArena) -> T;
-    fn visit_var(&mut self, idx: NodeId, arena: &SymArena) -> T;
+    fn visit_var(&mut self, id: VarId, idx: NodeId, arena: &SymArena) -> T;
     fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> T;
     fn visit_sub(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> T;
     fn visit_mul(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> T;

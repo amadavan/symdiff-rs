@@ -75,9 +75,9 @@ mod visitors;
 use std::collections::HashMap;
 
 use quote::quote;
-use syn::{Expr, Pat, Stmt};
+use syn::{Expr, Ident, Pat, Stmt};
 
-use arena::{NodeId, SymArena, SymNode};
+use arena::{NodeId, SymArena, SymNode, VarId};
 use transformers::{DiffTransformer, SimplifyTransformer};
 use visitors::{RefCountVisitor, ToTokenStreamVisitor};
 
@@ -102,19 +102,23 @@ fn parse_syn(arena: &mut SymArena, expr: &Expr, env: &HashMap<syn::Ident, NodeId
 
         Expr::Index(index_expr) => {
             if let Expr::Path(path_expr) = &*index_expr.expr {
-                if path_expr.path.is_ident("x") {
-                    if let Expr::Lit(lit) = &*index_expr.index {
-                        if let syn::Lit::Int(int_lit) = &lit.lit {
-                            let idx = int_lit.base10_parse::<NodeId>().unwrap();
-                            return arena.intern(SymNode::Var(idx));
+                if let Some(var_ident) = path_expr.path.get_ident() {
+                    if let Some(var_id) = arena.get_var_id(var_ident) {
+                        if let Expr::Lit(lit) = &*index_expr.index {
+                            if let syn::Lit::Int(int_lit) = &lit.lit {
+                                let idx = int_lit.base10_parse::<NodeId>().unwrap();
+                                return arena.intern(SymNode::Var(var_id, idx));
+                            } else {
+                                panic!("Expected integer literal for variable index");
+                            }
                         } else {
-                            panic!("Expected integer literal for variable index");
+                            panic!("Expected literal for variable index");
                         }
                     } else {
-                        panic!("Expected literal for variable index");
+                        panic!("Unexpected variable identifier");
                     }
                 } else {
-                    panic!("Expected variable name 'x'");
+                    panic!("Unable to find variable identifier");
                 }
             } else {
                 panic!("Expected variable access of the form x[i]");
@@ -194,12 +198,13 @@ fn parse_syn(arena: &mut SymArena, expr: &Expr, env: &HashMap<syn::Ident, NodeId
 fn compile_expression(
     arena: &mut SymArena,
     root_id: NodeId,
+    var_id: VarId,
     var_idx: usize,
-    max_passes: usize,
+    options: &Options,
 ) -> NodeId {
     let cost_estimates = HashMap::from([
         (SymNode::Const(0), 0),
-        (SymNode::Var(0), 0),
+        (SymNode::Var(0, 0), 0),
         (SymNode::Add(0, 0), 1),
         (SymNode::Sub(0, 0), 1),
         (SymNode::Mul(0, 0), 1),
@@ -214,12 +219,12 @@ fn compile_expression(
     ]);
 
     // Differentiate with respect to variable var_idx
-    let diff_transformer = DiffTransformer::new(var_idx);
+    let diff_transformer = DiffTransformer::new(var_id, var_idx);
     let mut root_id = arena.transform(root_id, &diff_transformer);
 
     // Simplify the result
     let simplify_transformer = SimplifyTransformer::new();
-    for _ in 0..max_passes {
+    for _ in 0..options.max_passes {
         let new_root_id = arena.transform(root_id, &simplify_transformer);
         if new_root_id == root_id {
             break; // No further simplification possible
@@ -229,7 +234,7 @@ fn compile_expression(
 
     // Commutative and associative reordering to canonicalize expressions and expose more common sub-expressions.
     let greedy_coordinator = GreedyCoordinator::new(&cost_estimates);
-    for _ in 0..max_passes {
+    for _ in 0..options.max_passes {
         let new_root_id = greedy_coordinator.optimize(root_id, arena);
         if new_root_id == root_id {
             break; // No further optimization possible
@@ -285,16 +290,38 @@ fn parse_body(
 
 /// Parsed attribute arguments for [`gradient`].
 #[derive(deluxe::ParseMetaItem)]
-struct DerivativeInput {
+struct DerivativeOptions {
+    // Variable over which to compute the gradient
+    var: Ident,
     /// Number of gradient components, i.e. the length of the output array.
     dim: usize,
     /// Maximum simplification passes; defaults to 10.
     max_passes: Option<usize>,
     /// Specify whether to output data as sparse structures
     sparse: Option<bool>,
+    /// Whether the input array access should be unchecked
+    unchecked: Option<bool>,
     /// Specify whether to prune the tree after simplification
     /// This operation may be expensive so diabled by default
     prune: Option<bool>,
+}
+
+struct Options {
+    max_passes: usize,
+    sparse: bool,
+    unchecked: bool,
+    prune: bool,
+}
+
+impl From<DerivativeOptions> for Options {
+    fn from(value: DerivativeOptions) -> Self {
+        Self {
+            max_passes: value.max_passes.unwrap_or(10),
+            sparse: value.sparse.unwrap_or(false),
+            unchecked: value.unchecked.unwrap_or(false),
+            prune: value.prune.unwrap_or(false),
+        }
+    }
 }
 
 /// Emit the original function unchanged, plus `{fn}_gradient(x: &[f64]) -> [f64; dim]`
@@ -306,19 +333,34 @@ pub fn gradient(
 ) -> proc_macro::TokenStream {
     let input_fn = syn::parse_macro_input!(item as syn::ItemFn);
     let fn_name = &input_fn.sig.ident;
-    let _params = &input_fn.sig.inputs;
+    let params = &input_fn.sig.inputs;
     let body = &input_fn.block;
     let vis = &input_fn.vis;
 
-    let DerivativeInput {
-        dim,
-        max_passes,
-        sparse,
-        prune,
-    } = deluxe::parse::<DerivativeInput>(attr.into())
+    let derivative_options = deluxe::parse::<DerivativeOptions>(attr.into())
         .expect("Failed to parse macro attribute arguments for gradient.");
+    let dim = derivative_options.dim;
+    let var = derivative_options.var.clone();
+    let options = Options::from(derivative_options);
 
     let mut arena = SymArena::new();
+
+    // Add all parameters as variables
+    let param_idents = params.iter().filter_map(|param| {
+        if let syn::FnArg::Typed(pat_type) = param {
+            if let syn::Pat::Ident(pat_ident) = *pat_type.pat.clone() {
+                return Some(pat_ident.ident);
+            }
+        }
+        None
+    });
+
+    param_idents.for_each(|ident| {
+        arena.intern_var_ident(&ident);
+    });
+
+    // Find the id of the variable of interest
+    let var_id = arena.get_var_id(&var).expect("Unable to find variable");
 
     let (env, func_def) = parse_body(&mut arena, body);
 
@@ -328,13 +370,13 @@ pub fn gradient(
 
     let root = parse_syn(&mut arena, &func_def.unwrap(), &env);
 
-    if prune.unwrap_or(false) {
+    if options.prune {
         // Prune the expression tree to remove any nodes that are not ancestors of the root.
         arena.prune(root);
     }
 
     let tokens = (0..dim)
-        .map(|i| compile_expression(&mut arena, root, i, max_passes.unwrap_or(10)))
+        .map(|i| compile_expression(&mut arena, root, var_id, i, &options))
         .collect::<Vec<_>>();
 
     // Count all references to each node to determine which sub-expressions are shared and should be hoisted into `let` bindings.
@@ -345,11 +387,15 @@ pub fn gradient(
     let mut instructions = Vec::new();
 
     // Generate tokens for the gradient expression, hoisting any shared sub-expressions into `let` bindings and caching their tokens for reuse.
-    let mut to_tokens_visitor =
-        ToTokenStreamVisitor::new(&ref_count.get_counts(), &mut cache, &mut instructions);
+    let mut to_tokens_visitor = ToTokenStreamVisitor::new(
+        &ref_count.get_counts(),
+        &mut cache,
+        &mut instructions,
+        &options,
+    );
 
     let (dim, gradient_token) = {
-        if sparse.unwrap_or(false) {
+        if options.sparse {
             // For sparse output, we must emit both the values and indices
             let sparse_tokens = tokens
                 .iter()
@@ -381,7 +427,7 @@ pub fn gradient(
     // Get the emitted `let` bindings in the order they must be emitted.
     let instruction_tokens = to_tokens_visitor.get_instructions().to_vec();
 
-    let return_type = if sparse.unwrap_or(false) {
+    let return_type = if options.sparse {
         quote! { ([usize; #dim], [f64; #dim]) }
     } else {
         quote! { [f64; #dim] }
@@ -395,9 +441,11 @@ pub fn gradient(
     let expanded = quote!(
         #input_fn
 
-        #vis fn #grad_name(x: &[f64]) -> #return_type {
-            #(#instruction_tokens)*
-            #gradient_token
+        #vis fn #grad_name(#params) -> #return_type {
+            unsafe {
+                #(#instruction_tokens)*
+                #gradient_token
+            }
         }
     );
 

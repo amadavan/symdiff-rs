@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::arena::{NodeId, SymArena, SymNode, SymTransformer};
+use crate::arena::{NodeId, SymArena, SymNode, SymTransformer, VarId};
 
 /// Computes the symbolic derivative of every node with respect to one variable.
 ///
@@ -8,12 +8,13 @@ use crate::arena::{NodeId, SymArena, SymNode, SymTransformer};
 /// rule for each transcendental.
 pub struct DiffTransformer {
     /// Index of the variable to differentiate with respect to.
-    var: NodeId,
+    var_id: VarId,
+    var_idx: NodeId,
 }
 
 impl DiffTransformer {
-    pub fn new(var: NodeId) -> DiffTransformer {
-        DiffTransformer { var }
+    pub fn new(var_id: VarId, var_idx: NodeId) -> DiffTransformer {
+        DiffTransformer { var_id, var_idx }
     }
 }
 
@@ -29,11 +30,12 @@ impl SymTransformer for DiffTransformer {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        if idx == self.var {
+        if id == self.var_id && idx == self.var_idx {
             arena.intern(SymNode::Const(1.0_f64.to_bits()))
         } else {
             arena.intern(SymNode::Const(0.0_f64.to_bits()))
@@ -213,11 +215,12 @@ impl SymTransformer for SimplifyTransformer {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        arena.intern(SymNode::Var(idx))
+        arena.intern(SymNode::Var(id, idx))
     }
 
     fn process_add(
@@ -389,7 +392,7 @@ impl SymTransformer for SimplifyTransformer {
         match exp {
             0 => return arena.intern(SymNode::Const(1.0_f64.to_bits())),
             1 => return base_id,
-            2 => return arena.intern(SymNode::Mul(base_id, base_id)),
+            // 2 => return arena.intern(SymNode::Mul(base_id, base_id)),
             _ => {}
         }
 
@@ -551,11 +554,12 @@ impl SymTransformer for CommutativeTransformer {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        arena.intern(SymNode::Var(idx))
+        arena.intern(SymNode::Var(id, idx))
     }
 
     fn process_add(
@@ -570,8 +574,8 @@ impl SymTransformer for CommutativeTransformer {
         match (left_node, right_node) {
             (SymNode::Const(_), _)
             | (_, SymNode::Const(_))
-            | (SymNode::Var(_), _)
-            | (_, SymNode::Var(_))
+            | (SymNode::Var(_, _), _)
+            | (_, SymNode::Var(_, _))
             | (SymNode::Add(_, _), _)
             | (_, SymNode::Add(_, _))
             | (SymNode::Sub(_, _), _)
@@ -594,8 +598,8 @@ impl SymTransformer for CommutativeTransformer {
         match (left_node, right_node) {
             (SymNode::Const(_), _)
             | (_, SymNode::Const(_))
-            | (SymNode::Var(_), _)
-            | (_, SymNode::Var(_))
+            | (SymNode::Var(_, _), _)
+            | (_, SymNode::Var(_, _))
             | (SymNode::Add(_, _), _)
             | (_, SymNode::Add(_, _))
             | (SymNode::Sub(_, _), _)
@@ -619,8 +623,8 @@ impl SymTransformer for CommutativeTransformer {
         match (left_node, right_node) {
             (SymNode::Const(_), _)
             | (_, SymNode::Const(_))
-            | (SymNode::Var(_), _)
-            | (_, SymNode::Var(_))
+            | (SymNode::Var(_, _), _)
+            | (_, SymNode::Var(_, _))
             | (SymNode::Mul(_, _), _)
             | (_, SymNode::Mul(_, _))
             | (SymNode::Div(_, _), _)
@@ -764,11 +768,12 @@ impl SymTransformer for AssociativeTransformer {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        arena.intern(SymNode::Var(idx))
+        arena.intern(SymNode::Var(id, idx))
     }
 
     fn process_add(
@@ -1008,14 +1013,15 @@ impl<'a> SymTransformer for RemapTransformer<'a> {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
         if let Some(&new_idx) = self.mapping.get(&idx) {
-            arena.intern(SymNode::Var(new_idx))
+            arena.intern(SymNode::Var(id, new_idx))
         } else {
-            arena.intern(SymNode::Var(idx))
+            arena.intern(SymNode::Var(id, idx))
         }
     }
 
