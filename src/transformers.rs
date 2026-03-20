@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::arena::{NodeId, SymArena, SymNode, SymTransformer};
+use crate::arena::{NodeId, SymArena, SymNode, SymTransformer, VarId};
 
 /// Computes the symbolic derivative of every node with respect to one variable.
 ///
@@ -8,12 +8,13 @@ use crate::arena::{NodeId, SymArena, SymNode, SymTransformer};
 /// rule for each transcendental.
 pub struct DiffTransformer {
     /// Index of the variable to differentiate with respect to.
-    var: NodeId,
+    var_id: VarId,
+    var_idx: NodeId,
 }
 
 impl DiffTransformer {
-    pub fn new(var: NodeId) -> DiffTransformer {
-        DiffTransformer { var }
+    pub fn new(var_id: VarId, var_idx: NodeId) -> DiffTransformer {
+        DiffTransformer { var_id, var_idx }
     }
 }
 
@@ -29,11 +30,12 @@ impl SymTransformer for DiffTransformer {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        if idx == self.var {
+        if id == self.var_id && idx == self.var_idx {
             arena.intern(SymNode::Const(1.0_f64.to_bits()))
         } else {
             arena.intern(SymNode::Const(0.0_f64.to_bits()))
@@ -213,11 +215,12 @@ impl SymTransformer for SimplifyTransformer {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        arena.intern(SymNode::Var(idx))
+        arena.intern(SymNode::Var(id, idx))
     }
 
     fn process_add(
@@ -385,6 +388,14 @@ impl SymTransformer for SimplifyTransformer {
             }
             _ => {}
         }
+
+        match exp {
+            0 => return arena.intern(SymNode::Const(1.0_f64.to_bits())),
+            1 => return base_id,
+            // 2 => return arena.intern(SymNode::Mul(base_id, base_id)),
+            _ => {}
+        }
+
         arena.intern(SymNode::Powi(base_id, exp))
     }
 
@@ -465,6 +476,10 @@ impl SymTransformer for SimplifyTransformer {
                 let exp_node = arena.intern(SymNode::Const((exp as f64).to_bits()));
                 return arena.intern(SymNode::Mul(exp_node, ln_base));
             }
+            SymNode::Exp(e) => {
+                // ln(exp(f)) = f
+                return e;
+            }
             _ => {}
         }
         arena.intern(SymNode::Ln(operand_id))
@@ -482,6 +497,10 @@ impl SymTransformer for SimplifyTransformer {
         match operand_node {
             SymNode::Const(value) => {
                 return arena.intern(SymNode::Const(f64::from_bits(value).exp().to_bits()));
+            }
+            SymNode::Ln(e) => {
+                // exp(ln(f)) = f
+                return e;
             }
             _ => {}
         }
@@ -535,11 +554,12 @@ impl SymTransformer for CommutativeTransformer {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        arena.intern(SymNode::Var(idx))
+        arena.intern(SymNode::Var(id, idx))
     }
 
     fn process_add(
@@ -554,8 +574,8 @@ impl SymTransformer for CommutativeTransformer {
         match (left_node, right_node) {
             (SymNode::Const(_), _)
             | (_, SymNode::Const(_))
-            | (SymNode::Var(_), _)
-            | (_, SymNode::Var(_))
+            | (SymNode::Var(_, _), _)
+            | (_, SymNode::Var(_, _))
             | (SymNode::Add(_, _), _)
             | (_, SymNode::Add(_, _))
             | (SymNode::Sub(_, _), _)
@@ -578,8 +598,8 @@ impl SymTransformer for CommutativeTransformer {
         match (left_node, right_node) {
             (SymNode::Const(_), _)
             | (_, SymNode::Const(_))
-            | (SymNode::Var(_), _)
-            | (_, SymNode::Var(_))
+            | (SymNode::Var(_, _), _)
+            | (_, SymNode::Var(_, _))
             | (SymNode::Add(_, _), _)
             | (_, SymNode::Add(_, _))
             | (SymNode::Sub(_, _), _)
@@ -603,13 +623,21 @@ impl SymTransformer for CommutativeTransformer {
         match (left_node, right_node) {
             (SymNode::Const(_), _)
             | (_, SymNode::Const(_))
-            | (SymNode::Var(_), _)
-            | (_, SymNode::Var(_))
+            | (SymNode::Var(_, _), _)
+            | (_, SymNode::Var(_, _))
             | (SymNode::Mul(_, _), _)
             | (_, SymNode::Mul(_, _))
             | (SymNode::Div(_, _), _)
             | (_, SymNode::Div(_, _)) => {
                 return arena.intern(SymNode::Mul(right, left));
+            }
+            (SymNode::Neg(e1), _) => {
+                let new_right = arena.intern(SymNode::Neg(right));
+                return arena.intern(SymNode::Mul(e1, new_right));
+            }
+            (_, SymNode::Neg(e2)) => {
+                let new_left = arena.intern(SymNode::Neg(left));
+                return arena.intern(SymNode::Mul(new_left, e2));
             }
             _ => arena.intern(SymNode::Mul(left, right)),
         }
@@ -640,6 +668,14 @@ impl SymTransformer for CommutativeTransformer {
             (_, SymNode::Div(r1, r2)) => {
                 let new_left = arena.intern(SymNode::Mul(left, r2));
                 return arena.intern(SymNode::Div(new_left, r1));
+            }
+            (SymNode::Neg(e1), _) => {
+                let new_right = arena.intern(SymNode::Neg(right));
+                return arena.intern(SymNode::Div(e1, new_right));
+            }
+            (_, SymNode::Neg(e2)) => {
+                let new_left = arena.intern(SymNode::Neg(left));
+                return arena.intern(SymNode::Div(new_left, e2));
             }
             _ => arena.intern(SymNode::Div(left, right)),
         }
@@ -732,11 +768,12 @@ impl SymTransformer for AssociativeTransformer {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
-        arena.intern(SymNode::Var(idx))
+        arena.intern(SymNode::Var(id, idx))
     }
 
     fn process_add(
@@ -888,7 +925,20 @@ impl SymTransformer for AssociativeTransformer {
             SymNode::Const(value) => {
                 return arena.intern(SymNode::Const((-f64::from_bits(value)).to_bits()));
             }
+            SymNode::Add(l1, l2) => {
+                let new_left = arena.intern(SymNode::Neg(l1));
+                let new_right = arena.intern(SymNode::Neg(l2));
+                return arena.intern(SymNode::Add(new_left, new_right));
+            }
             SymNode::Sub(l1, l2) => return arena.intern(SymNode::Sub(l2, l1)),
+            SymNode::Mul(l1, l2) => {
+                let new_left = arena.intern(SymNode::Neg(l1));
+                return arena.intern(SymNode::Mul(new_left, l2));
+            }
+            SymNode::Div(l1, l2) => {
+                let new_left = arena.intern(SymNode::Neg(l1));
+                return arena.intern(SymNode::Div(new_left, l2));
+            }
             _ => arena.intern(SymNode::Neg(operand)),
         }
     }
@@ -963,14 +1013,15 @@ impl<'a> SymTransformer for RemapTransformer<'a> {
 
     fn process_var(
         &self,
+        id: VarId,
         idx: NodeId,
         arena: &mut SymArena,
         _diff: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
         if let Some(&new_idx) = self.mapping.get(&idx) {
-            arena.intern(SymNode::Var(new_idx))
+            arena.intern(SymNode::Var(id, new_idx))
         } else {
-            arena.intern(SymNode::Var(idx))
+            arena.intern(SymNode::Var(id, idx))
         }
     }
 

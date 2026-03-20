@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::Ident;
 
-use crate::arena::{NodeId, SymArena, SymNode, SymVisitor};
+use crate::{
+    Options,
+    arena::{NodeId, SymArena, SymNode, SymVisitor, VarId},
+};
 
 /// Estimates the total evaluation cost of an expression tree by summing
 /// per-node costs from a provided table (see `compile_expression` in `lib.rs`).
@@ -23,8 +25,8 @@ impl<'a> SymVisitor<usize> for CostEstimateVisitor<'a> {
         *self.costs.get(&SymNode::Const(0)).unwrap_or(&0)
     }
 
-    fn visit_var(&mut self, _idx: NodeId, _arena: &SymArena) -> usize {
-        *self.costs.get(&SymNode::Var(0)).unwrap_or(&0)
+    fn visit_var(&mut self, _id: VarId, _idx: NodeId, _arena: &SymArena) -> usize {
+        *self.costs.get(&SymNode::Var(0, 0)).unwrap_or(&0)
     }
 
     fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> usize {
@@ -110,7 +112,7 @@ impl SymVisitor<()> for RefCountVisitor {
     fn visit_const(&mut self, _value: u64, _arena: &SymArena) -> () {}
 
     // Variables should always be referenced at least once and will be inlined
-    fn visit_var(&mut self, idx: NodeId, _arena: &SymArena) -> () {}
+    fn visit_var(&mut self, _id: VarId, _idx: NodeId, _arena: &SymArena) -> () {}
 
     fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> () {
         arena.accept(left, self);
@@ -214,6 +216,7 @@ pub struct ToTokenStreamVisitor<'a> {
     cache: &'a mut HashMap<NodeId, TokenStream>,
     /// Accumulated `let` bindings in emission order.
     instructions: &'a mut Vec<TokenStream>,
+    options: &'a Options,
 }
 
 impl<'a> ToTokenStreamVisitor<'a> {
@@ -221,11 +224,13 @@ impl<'a> ToTokenStreamVisitor<'a> {
         counts: &'a HashMap<NodeId, usize>,
         cache: &'a mut HashMap<NodeId, TokenStream>,
         instructions: &'a mut Vec<TokenStream>,
+        options: &'a Options,
     ) -> ToTokenStreamVisitor<'a> {
         ToTokenStreamVisitor {
             counts,
             cache,
             instructions,
+            options,
         }
     }
 
@@ -262,9 +267,13 @@ impl SymVisitor<TokenStream> for ToTokenStreamVisitor<'_> {
         quote! { #f }
     }
 
-    fn visit_var(&mut self, idx: NodeId, _arena: &SymArena) -> TokenStream {
-        let var_name = Ident::new("x", proc_macro2::Span::call_site());
-        quote! { #var_name[#idx] }
+    fn visit_var(&mut self, id: VarId, idx: NodeId, arena: &SymArena) -> TokenStream {
+        let var_ident = arena.get_var_ident(id);
+        if self.options.unchecked {
+            quote! { (*#var_ident.get_unchecked(#idx)) }
+        } else {
+            quote! { #var_ident[#idx] }
+        }
     }
 
     fn visit_add(&mut self, left: NodeId, right: NodeId, arena: &SymArena) -> TokenStream {
